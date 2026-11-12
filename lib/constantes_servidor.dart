@@ -36,7 +36,7 @@ class ConstantesServidor {
   // Red, temporizadores y tolerancia a desconexiones
   static const int puertoPorDefecto = 8080;
   static const int segundosFaseInicial = 60;
-  static const int segundosPorRonda = 45;
+  static const int segundosPorRonda = 60;
   static const int segundosGraciaReconexionPartida = 45;
   static const int segundosGraciaReconexionLobby = 20;
   static const Duration intervaloHeartbeat = Duration(seconds: 5);

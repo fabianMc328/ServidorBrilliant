@@ -321,6 +321,14 @@ class ServidorWebsocketBrilliant {
         final id = _exigirJugadorAutenticado(jugadorActualId);
         gestor.concederPartida(jugadorId: id);
         return id;
+
+      case TipoComandoCliente.enviarMensajeChat:
+        final id = _exigirJugadorAutenticado(jugadorActualId);
+        gestor.enviarMensajeChat(
+          jugadorId: id,
+          texto: (datos['texto'] as String?) ?? '',
+        );
+        return id;
     }
   }
 

@@ -418,5 +418,37 @@ void main() {
       expect(victoriaAbandono.motivoFin, MotivoFinPartida.abandonoRival);
       expect(victoriaAbandono.ganadoresIds, [victoriaAbandono.miJugadorId]);
     });
+
+    test('Envía y difunde mensajes de chat a todos los integrantes de la sala', () async {
+      final j1 = await nuevoCliente();
+      final j2 = await nuevoCliente();
+
+      final ev1 = await j1.enviarConRespuesta(
+        TipoComandoCliente.crearSala,
+        {'apodo': 'HostChat', 'nivelId': 'nivel_1'},
+      );
+      final codigo = ev1.credencial!.codigoSala;
+
+      await j2.enviarConRespuesta(
+        TipoComandoCliente.unirseSala,
+        {'codigoSala': codigo, 'apodo': 'InvitadoChat'},
+      );
+
+      final escuchaChatJ2 = j2.eventos.firstWhere(
+        (e) =>
+            e.tipo == TipoEventoServidor.mensajeChatRecibido &&
+            e.mensajeChat?.texto == '¡Hola desde J1!',
+      ).timeout(const Duration(seconds: 3));
+
+      j1.enviarComando(
+        TipoComandoCliente.enviarMensajeChat,
+        {'texto': '¡Hola desde J1!'},
+      );
+
+      final recibidoJ2 = await escuchaChatJ2;
+      expect(recibidoJ2.mensajeChat?.remitenteApodo, 'HostChat');
+      expect(recibidoJ2.mensajeChat?.texto, '¡Hola desde J1!');
+      expect(recibidoJ2.mensajeChat?.esSistema, isFalse);
+    });
   });
 }

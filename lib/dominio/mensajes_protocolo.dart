@@ -15,6 +15,7 @@ enum TipoComandoCliente {
   jugarTurno,
   pasarTurno,
   concederPartida,
+  enviarMensajeChat,
   ping;
 
   static TipoComandoCliente? desdeNombre(String? nombre) {
@@ -30,6 +31,7 @@ enum TipoComandoCliente {
 enum TipoEventoServidor {
   sesionEstablecida,
   actualizacionSala,
+  mensajeChatRecibido,
   errorOperacion,
   pong;
 
@@ -125,12 +127,57 @@ class CredencialSesionSala {
   }
 }
 
+/// Mensaje de chat en tiempo real dentro de una sala multijugador.
+class MensajeChat {
+  final String id;
+  final String codigoSala;
+  final String remitenteId;
+  final String remitenteApodo;
+  final String texto;
+  final DateTime fecha;
+  final bool esSistema;
+
+  const MensajeChat({
+    required this.id,
+    required this.codigoSala,
+    required this.remitenteId,
+    required this.remitenteApodo,
+    required this.texto,
+    required this.fecha,
+    this.esSistema = false,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'codigoSala': codigoSala,
+        'remitenteId': remitenteId,
+        'remitenteApodo': remitenteApodo,
+        'texto': texto,
+        'fecha': fecha.toIso8601String(),
+        'esSistema': esSistema,
+      };
+
+  factory MensajeChat.fromJson(Map<String, dynamic> json) {
+    return MensajeChat(
+      id: json['id'] as String,
+      codigoSala: json['codigoSala'] as String,
+      remitenteId: json['remitenteId'] as String,
+      remitenteApodo: json['remitenteApodo'] as String,
+      texto: json['texto'] as String,
+      fecha:
+          DateTime.tryParse(json['fecha'] as String? ?? '') ?? DateTime.now(),
+      esSistema: (json['esSistema'] as bool?) ?? false,
+    );
+  }
+}
+
 /// Mensaje estructurado Servidor -> Cliente.
 class EventoServidor {
   final TipoEventoServidor tipo;
   final String? solicitudId;
   final CredencialSesionSala? credencial;
   final EstadoSalaMultijugador? estadoSala;
+  final MensajeChat? mensajeChat;
   final FalloMultijugador? fallo;
 
   const EventoServidor({
@@ -138,6 +185,7 @@ class EventoServidor {
     this.solicitudId,
     this.credencial,
     this.estadoSala,
+    this.mensajeChat,
     this.fallo,
   });
 
@@ -146,6 +194,7 @@ class EventoServidor {
         if (solicitudId != null) 'solicitudId': solicitudId,
         if (credencial != null) 'credencial': credencial!.toJson(),
         if (estadoSala != null) 'estadoSala': estadoSala!.toJson(),
+        if (mensajeChat != null) 'mensajeChat': mensajeChat!.toJson(),
         if (fallo != null) 'fallo': fallo!.toJson(),
       };
 
@@ -168,6 +217,11 @@ class EventoServidor {
       estadoSala: json['estadoSala'] != null
           ? EstadoSalaMultijugador.fromJson(
               json['estadoSala'] as Map<String, dynamic>,
+            )
+          : null,
+      mensajeChat: json['mensajeChat'] != null
+          ? MensajeChat.fromJson(
+              json['mensajeChat'] as Map<String, dynamic>,
             )
           : null,
       fallo: json['fallo'] != null

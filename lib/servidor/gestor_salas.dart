@@ -540,6 +540,8 @@ class GestorSalas {
     jugador.confirmoAccionActual = true;
     jugador.ticksGraciaRestantes = null;
     sala.mensajeEventoReciente = '${jugador.apodo} ha concedido la partida.';
+    _emitirMensajeSistema(
+        sala.codigo, '${jugador.apodo} ha concedido la partida.');
 
     if (_verificarFinPorUnicoSobreviviente(
       sala,
@@ -556,6 +558,61 @@ class GestorSalas {
       _cerrarRondaYEvaluar(sala);
     } else {
       _difundirEstadoSala(sala);
+    }
+  }
+
+  void enviarMensajeChat({
+    required String jugadorId,
+    required String texto,
+  }) {
+    final (sala, jugador) = _obtenerContextoJugador(jugadorId);
+    final limpio = texto.trim();
+    if (limpio.isEmpty) return;
+    if (limpio.length > 250) {
+      throw const FalloMultijugador(
+        codigo: CodigoFalloMultijugador.mensajeMalformado,
+        mensaje: 'El mensaje de chat no puede superar los 250 caracteres.',
+      );
+    }
+
+    final mensaje = MensajeChat(
+      id: 'msg_${DateTime.now().millisecondsSinceEpoch}_${_random.nextInt(9999)}',
+      codigoSala: sala.codigo,
+      remitenteId: jugador.id,
+      remitenteApodo: jugador.apodo,
+      texto: limpio,
+      fecha: DateTime.now(),
+      esSistema: false,
+    );
+
+    _difundirMensajeChat(sala, mensaje);
+  }
+
+  void _emitirMensajeSistema(String codigoSala, String texto) {
+    final sala = _salasPorCodigo[codigoSala];
+    if (sala == null) return;
+    final mensaje = MensajeChat(
+      id: 'msg_sys_${DateTime.now().millisecondsSinceEpoch}_${_random.nextInt(9999)}',
+      codigoSala: codigoSala,
+      remitenteId: 'sistema',
+      remitenteApodo: 'Sistema',
+      texto: texto,
+      fecha: DateTime.now(),
+      esSistema: true,
+    );
+    _difundirMensajeChat(sala, mensaje);
+  }
+
+  void _difundirMensajeChat(_SalaActiva sala, MensajeChat mensaje) {
+    for (final j in sala.jugadores) {
+      if (!j.participacion.estaConectadoActivo) continue;
+      _enviarA(
+        j.id,
+        EventoServidor(
+          tipo: TipoEventoServidor.mensajeChatRecibido,
+          mensajeChat: mensaje,
+        ),
+      );
     }
   }
 
@@ -639,6 +696,21 @@ class GestorSalas {
             } else if (sala.fase != FaseSala.finalizada) {
               j.participacion = EstadoParticipacion.abandonado;
               j.confirmoAccionActual = true;
+              if (j.esAnfitrion) {
+                j.esAnfitrion = false;
+                final enComp = sala.jugadoresEnCompetencia;
+                if (enComp.isNotEmpty) {
+                  final nuevoHost = enComp.firstWhere(
+                    (c) => c.participacion.estaConectadoActivo,
+                    orElse: () => enComp.first,
+                  );
+                  nuevoHost.esAnfitrion = true;
+                  _emitirMensajeSistema(
+                    sala.codigo,
+                    'El anfitrión ${j.apodo} abandonó la partida. ${nuevoHost.apodo} es ahora el nuevo anfitrión.',
+                  );
+                }
+              }
               sala.mensajeEventoReciente =
                   '${j.apodo} abandonó la partida por desconexión.';
               if (_verificarFinPorUnicoSobreviviente(
@@ -675,10 +747,11 @@ class GestorSalas {
       } else if (sala.fase == FaseSala.jugandoRondas) {
         if (_todosEnCompetenciaConfirmaron(sala) ||
             sala.segundosRestantes <= 0) {
+          final fuePorTiempo = sala.segundosRestantes <= 0;
           for (final j in sala.jugadoresEnCompetencia) {
             j.confirmoAccionActual = true;
           }
-          _cerrarRondaYEvaluar(sala);
+          _cerrarRondaYEvaluar(sala, porTiempoAgotado: fuePorTiempo);
           continue;
         }
       }
@@ -756,7 +829,7 @@ class GestorSalas {
     _difundirEstadoSala(sala);
   }
 
-  void _cerrarRondaYEvaluar(_SalaActiva sala) {
+  void _cerrarRondaYEvaluar(_SalaActiva sala, {bool porTiempoAgotado = false}) {
     final enCompetencia = sala.jugadoresEnCompetencia;
     final completasPorJugador = <String, Set<String>>{
       for (final j in enCompetencia) j.id: j.tablero.idsRegionesCompletas(),
@@ -826,10 +899,28 @@ class GestorSalas {
     final resumenEventos = resolucion.eventosCompletadoRonda.isNotEmpty
         ? resolucion.eventosCompletadoRonda.join(' • ')
         : null;
+
+    final prefijoTiempo = porTiempoAgotado
+        ? '¡Tiempo de turno agotado (60s)! '
+        : '';
+
+    final mensajeAviso = prefijoTiempo.isNotEmpty
+        ? (resumenEventos != null
+            ? '$prefijoTiempo$resumenEventos'
+            : '${prefijoTiempo}Ronda ${sala.rondaActual + 1}: dados ${sala.dado1} y ${sala.dado2}.')
+        : resumenEventos;
+
+    if (porTiempoAgotado) {
+      _emitirMensajeSistema(
+        sala.codigo,
+        'Tiempo de turno agotado (60s). Avanzando a la ronda ${sala.rondaActual + 1}.',
+      );
+    }
+
     _avanzarASiguienteRonda(
       sala,
       esPrimeraRonda: false,
-      mensajePrevio: resumenEventos,
+      mensajePrevio: mensajeAviso,
     );
   }
 

@@ -117,8 +117,17 @@ class MotorPuntuacionCarrera {
         final puntosPremio = estadoRegion.puntosDisponibles(region.puntuaciones);
         for (final jugadorId in nuevosGanadores) {
           nuevoDesglose[jugadorId]![region.id] = puntosPremio;
-          final apodo = apodosPorJugador[jugadorId] ?? jugadorId;
-          eventos.add('$apodo completó ${region.id} (+$puntosPremio pts)');
+        }
+
+        if (nuevosGanadores.length > 1) {
+          final nombres =
+              nuevosGanadores.map((id) => apodosPorJugador[id] ?? id).join(' y ');
+          eventos.add(
+              '¡$nombres completaron simultáneamente ${region.id}! Todos obtienen $puntosPremio pts de ${estadoRegion.escalonActual}.º lugar 🎉');
+        } else {
+          final apodo = apodosPorJugador[nuevosGanadores.first] ?? nuevosGanadores.first;
+          eventos.add(
+              '$apodo completó ${region.id} (+$puntosPremio pts, ${estadoRegion.escalonActual}.º lugar)');
         }
 
         nuevaCarrera[region.id] = EstadoCarreraRegion(
