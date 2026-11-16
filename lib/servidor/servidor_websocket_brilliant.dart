@@ -16,6 +16,7 @@ class ServidorWebsocketBrilliant {
   final Random? _random;
 
   HttpServer? _httpServer;
+  RawDatagramSocket? _udpDescubrimiento;
   GestorSalas? _gestor;
   final Map<String, WebSocket> _socketsPorJugador = {};
   final Set<WebSocket> _socketsAbiertos = {};
@@ -60,11 +61,55 @@ class ServidorWebsocketBrilliant {
       cancelOnError: false,
     );
 
+    await _iniciarDescubrimientoUdp(server.port);
+
     return server.port;
+  }
+
+  Future<void> _iniciarDescubrimientoUdp(int puertoWebsocket) async {
+    try {
+      final udp = await RawDatagramSocket.bind(
+        InternetAddress.anyIPv4,
+        ConstantesServidor.puertoDescubrimientoUdp,
+        reuseAddress: true,
+      );
+      udp.broadcastEnabled = true;
+      _udpDescubrimiento = udp;
+
+      udp.listen(
+        (event) {
+          if (event != RawSocketEvent.read) return;
+          final datagram = udp.receive();
+          if (datagram == null) return;
+
+          final texto = utf8.decode(datagram.data, allowMalformed: true).trim();
+          if (texto == ConstantesServidor.mensajeDescubrimientoUdp) {
+            final respuesta = jsonEncode({
+              'servicio': 'servidorBrilliant',
+              'puerto': puertoWebsocket,
+            });
+            try {
+              udp.send(
+                utf8.encode(respuesta),
+                datagram.address,
+                datagram.port,
+              );
+            } catch (_) {}
+          }
+        },
+        onError: (_) {},
+        cancelOnError: false,
+      );
+    } catch (_) {
+      // Si el puerto UDP ya está ocupado (ej. pruebas paralelas), continúa sin error.
+    }
   }
 
   /// Detiene el servidor y cierra limpiamente todos los sockets conectados.
   Future<void> detener() async {
+    _udpDescubrimiento?.close();
+    _udpDescubrimiento = null;
+
     _gestor?.cerrar();
     _gestor = null;
     _socketsPorJugador.clear();
@@ -88,9 +133,12 @@ class ServidorWebsocketBrilliant {
     if (request.uri.path == '/salud') {
       request.response.statusCode = HttpStatus.ok;
       request.response.headers.contentType = ContentType.json;
+      request.response.headers.set('Access-Control-Allow-Origin', '*');
       request.response.write(
         jsonEncode({
+          'servicio': 'servidorBrilliant',
           'estado': 'ok',
+          'puerto': puertoEscucha,
           'salasActivas': cantidadSalasActivas,
         }),
       );
@@ -292,6 +340,11 @@ class ServidorWebsocketBrilliant {
           jugadorId: id,
           valoresEstrellas: ComandoCliente.deserializarMapaPosiciones(rawMapa),
         );
+        return id;
+
+      case TipoComandoCliente.tirarDados:
+        final id = _exigirJugadorAutenticado(jugadorActualId);
+        gestor.tirarDados(jugadorId: id);
         return id;
 
       case TipoComandoCliente.jugarTurno:

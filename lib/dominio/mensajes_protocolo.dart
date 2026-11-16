@@ -12,6 +12,7 @@ enum TipoComandoCliente {
   alternarListo,
   iniciarPartida,
   confirmarIniciales,
+  tirarDados,
   jugarTurno,
   pasarTurno,
   concederPartida,

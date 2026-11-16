@@ -11,6 +11,7 @@ class ResumenJugador {
   final int regionesCompletadas;
   final int casillasOcupadas;
   final bool confirmoAccionActual;
+  final int? segundosReconexionRestantes;
 
   const ResumenJugador({
     required this.id,
@@ -22,6 +23,7 @@ class ResumenJugador {
     this.regionesCompletadas = 0,
     this.casillasOcupadas = 0,
     this.confirmoAccionActual = false,
+    this.segundosReconexionRestantes,
   });
 
   ResumenJugador copiarCon({
@@ -34,6 +36,7 @@ class ResumenJugador {
     int? regionesCompletadas,
     int? casillasOcupadas,
     bool? confirmoAccionActual,
+    int? segundosReconexionRestantes,
   }) {
     return ResumenJugador(
       id: id ?? this.id,
@@ -45,6 +48,8 @@ class ResumenJugador {
       regionesCompletadas: regionesCompletadas ?? this.regionesCompletadas,
       casillasOcupadas: casillasOcupadas ?? this.casillasOcupadas,
       confirmoAccionActual: confirmoAccionActual ?? this.confirmoAccionActual,
+      segundosReconexionRestantes:
+          segundosReconexionRestantes ?? this.segundosReconexionRestantes,
     );
   }
 
@@ -58,6 +63,8 @@ class ResumenJugador {
         'regionesCompletadas': regionesCompletadas,
         'casillasOcupadas': casillasOcupadas,
         'confirmoAccionActual': confirmoAccionActual,
+        if (segundosReconexionRestantes != null)
+          'segundosReconexionRestantes': segundosReconexionRestantes,
       };
 
   factory ResumenJugador.fromJson(Map<String, dynamic> json) {
@@ -73,6 +80,8 @@ class ResumenJugador {
       regionesCompletadas: (json['regionesCompletadas'] as num?)?.toInt() ?? 0,
       casillasOcupadas: (json['casillasOcupadas'] as num?)?.toInt() ?? 0,
       confirmoAccionActual: (json['confirmoAccionActual'] as bool?) ?? false,
+      segundosReconexionRestantes:
+          (json['segundosReconexionRestantes'] as num?)?.toInt(),
     );
   }
 }

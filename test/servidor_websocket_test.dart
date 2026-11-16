@@ -5,6 +5,7 @@ import 'dart:math';
 
 import 'package:test/test.dart';
 
+import 'package:servidor_brilliant/constantes_servidor.dart';
 import 'package:servidor_brilliant/dominio/catalogo_esquemas_mapa.dart';
 import 'package:servidor_brilliant/dominio/estado_sala.dart';
 import 'package:servidor_brilliant/dominio/estados_sala.dart';
@@ -317,15 +318,53 @@ void main() {
         );
       }
 
-      final r1 = await j1.esperarSala((s) => s.fase == FaseSala.jugandoRondas);
-      final r2 = await j2.esperarSala((s) => s.fase == FaseSala.jugandoRondas);
-      final r3 = await j3.esperarSala((s) => s.fase == FaseSala.jugandoRondas);
+      final esperaDados1 = await j1.esperarSala(
+        (s) => s.fase == FaseSala.jugandoRondas && s.esperandoTiroDados,
+      );
+      expect(esperaDados1.dado1, isNull);
+      expect(esperaDados1.dado2, isNull);
+
+      // Invitado NO puede tirar dados
+      await expectLater(
+        () => j2.enviarConRespuesta(TipoComandoCliente.tirarDados),
+        throwsA(
+          isA<FalloMultijugador>().having(
+            (f) => f.codigo,
+            'codigo',
+            CodigoFalloMultijugador.permisoDenegado,
+          ),
+        ),
+      );
+
+      // El anfitrión tira los dados para iniciar la Ronda 1
+      j1.enviarComando(TipoComandoCliente.tirarDados);
+
+      final r1 = await j1.esperarSala(
+        (s) => s.fase == FaseSala.jugandoRondas && !s.esperandoTiroDados,
+      );
+      final r2 = await j2.esperarSala(
+        (s) => s.fase == FaseSala.jugandoRondas && !s.esperandoTiroDados,
+      );
+      final r3 = await j3.esperarSala(
+        (s) => s.fase == FaseSala.jugandoRondas && !s.esperandoTiroDados,
+      );
 
       expect(r1.dado1, isNotNull);
       expect(r1.dado1, r2.dado1);
       expect(r1.dado1, r3.dado1);
       expect(r1.dado2, r2.dado2);
       expect(r1.metaPuntos, 24);
+
+      // Todos pasan turno -> pasa a Ronda 2 pero NO se tiran dados automáticamente
+      j1.enviarComando(TipoComandoCliente.pasarTurno, {'ronda': 1});
+      j2.enviarComando(TipoComandoCliente.pasarTurno, {'ronda': 1});
+      j3.enviarComando(TipoComandoCliente.pasarTurno, {'ronda': 1});
+
+      final ronda2Espera = await j1.esperarSala(
+        (s) => s.rondaActual == 2 && s.esperandoTiroDados,
+      );
+      expect(ronda2Espera.dado1, isNull);
+      expect(ronda2Espera.dado2, isNull);
 
       // J3 concede -> la partida continúa entre J1 y J2
       j3.enviarComando(TipoComandoCliente.concederPartida);
@@ -449,6 +488,49 @@ void main() {
       expect(recibidoJ2.mensajeChat?.remitenteApodo, 'HostChat');
       expect(recibidoJ2.mensajeChat?.texto, '¡Hola desde J1!');
       expect(recibidoJ2.mensajeChat?.esSistema, isFalse);
+    });
+
+    test('Gracia por desconexión es de 30s y difunde contador regresivo en tiempo real', () async {
+      expect(ConstantesServidor.segundosGraciaReconexionPartida, 30);
+      expect(ConstantesServidor.segundosGraciaReconexionLobby, 30);
+
+      final j1 = await nuevoCliente();
+      final j2 = await nuevoCliente();
+
+      final ev1 = await j1.enviarConRespuesta(
+        TipoComandoCliente.crearSala,
+        {'apodo': 'AnfitrionTimer', 'nivelId': 'nivel_1'},
+      );
+      final codigo = ev1.credencial!.codigoSala;
+      await j2.enviarConRespuesta(
+        TipoComandoCliente.unirseSala,
+        {'codigoSala': codigo, 'apodo': 'InvitadoTimer'},
+      );
+
+      // J1 se desconecta abruptamente en el lobby -> gracia inicial 3s (según setUp) y baja a 2s, 1s en tiempo real
+      await j1.socket.close(WebSocketStatus.goingAway);
+
+      final estadoInicial = await j2.esperarSala(
+        (s) =>
+            (s.mensajeEventoReciente ?? '').contains('3s') &&
+            s.jugadores.any(
+              (j) =>
+                  j.apodo == 'AnfitrionTimer' &&
+                  j.segundosReconexionRestantes == 3,
+            ),
+      );
+      expect(estadoInicial.mensajeEventoReciente, contains('3s'));
+
+      final estadoCuentaRegresiva = await j2.esperarSala(
+        (s) =>
+            (s.mensajeEventoReciente ?? '').contains('2s') &&
+            s.jugadores.any(
+              (j) =>
+                  j.apodo == 'AnfitrionTimer' &&
+                  j.segundosReconexionRestantes == 2,
+            ),
+      );
+      expect(estadoCuentaRegresiva.mensajeEventoReciente, contains('2s'));
     });
   });
 }

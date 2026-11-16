@@ -71,6 +71,10 @@ class _EstadoInternoJugador {
       regionesCompletadas: tablero.idsRegionesCompletas().length,
       casillasOcupadas: tablero.cantidadOcupadas,
       confirmoAccionActual: confirmoAccionActual,
+      segundosReconexionRestantes:
+          participacion == EstadoParticipacion.reconectando
+              ? ticksGraciaRestantes
+              : null,
     );
   }
 }
@@ -83,6 +87,7 @@ class _SalaActiva {
   int rondaActual = 0;
   int? dado1;
   int? dado2;
+  bool esperandoTiroDados = false;
   int segundosRestantes = 0;
   int metaPuntos = ConstantesServidor.metaPuntos2Jugadores;
   Map<String, EstadoCarreraRegion> carreraPorRegion = {};
@@ -91,6 +96,7 @@ class _SalaActiva {
   String? mensajeEventoReciente;
   bool huboJugadaEnRondaActual = false;
   int rondasConsecutivasSinJugadas = 0;
+  int? ticksLimpiezaFinalizada;
 
   _SalaActiva({
     required this.codigo,
@@ -467,6 +473,32 @@ class GestorSalas {
     }
   }
 
+  void tirarDados({required String jugadorId}) {
+    final (sala, jugador) = _obtenerContextoJugador(jugadorId);
+    if (sala.fase != FaseSala.jugandoRondas) return;
+    if (!jugador.esAnfitrion) {
+      throw const FalloMultijugador(
+        codigo: CodigoFalloMultijugador.permisoDenegado,
+        mensaje: 'Solo el anfitrión de la sala puede tirar los dados.',
+      );
+    }
+    if (!sala.esperandoTiroDados) return;
+
+    sala.dado1 = _random.nextInt(ConstantesServidor.valorMaximoDado) + 1;
+    sala.dado2 = _random.nextInt(ConstantesServidor.valorMaximoDado) + 1;
+    sala.esperandoTiroDados = false;
+    sala.segundosRestantes = _tiempos.segundosPorRonda;
+    sala.huboJugadaEnRondaActual = false;
+
+    for (final j in sala.jugadores) {
+      j.confirmoAccionActual = !j.participacion.sigueEnCompetencia;
+    }
+
+    sala.mensajeEventoReciente =
+        '${jugador.apodo} tiró los dados (Ronda ${sala.rondaActual}): ${sala.dado1} y ${sala.dado2}.';
+    _difundirEstadoSala(sala);
+  }
+
   void jugarTurno({
     required String jugadorId,
     required int ronda,
@@ -476,6 +508,7 @@ class GestorSalas {
   }) {
     final (sala, jugador) = _obtenerContextoJugador(jugadorId);
     if (sala.fase != FaseSala.jugandoRondas) return;
+    if (sala.esperandoTiroDados) return;
     if (!jugador.participacion.sigueEnCompetencia) return;
     if (ronda != sala.rondaActual || jugador.confirmoAccionActual) return;
 
@@ -516,6 +549,7 @@ class GestorSalas {
   }) {
     final (sala, jugador) = _obtenerContextoJugador(jugadorId);
     if (sala.fase != FaseSala.jugandoRondas) return;
+    if (sala.esperandoTiroDados) return;
     if (!jugador.participacion.sigueEnCompetencia) return;
     if (ronda != sala.rondaActual || jugador.confirmoAccionActual) return;
 
@@ -550,10 +584,27 @@ class GestorSalas {
       return;
     }
 
+    if (jugador.esAnfitrion) {
+      jugador.esAnfitrion = false;
+      final enComp = sala.jugadoresEnCompetencia;
+      if (enComp.isNotEmpty) {
+        final nuevoHost = enComp.firstWhere(
+          (c) => c.participacion.estaConectadoActivo,
+          orElse: () => enComp.first,
+        );
+        nuevoHost.esAnfitrion = true;
+        _emitirMensajeSistema(
+          sala.codigo,
+          '${nuevoHost.apodo} es ahora el nuevo anfitrión.',
+        );
+      }
+    }
+
     if (sala.fase == FaseSala.configurandoIniciales &&
         _todosEnCompetenciaConfirmaron(sala)) {
       _avanzarASiguienteRonda(sala, esPrimeraRonda: true);
     } else if (sala.fase == FaseSala.jugandoRondas &&
+        !sala.esperandoTiroDados &&
         _todosEnCompetenciaConfirmaron(sala)) {
       _cerrarRondaYEvaluar(sala);
     } else {
@@ -627,9 +678,32 @@ class GestorSalas {
       return;
     }
 
+    if (sala.fase == FaseSala.finalizada) {
+      final jugador = sala.jugadorPorId(jugadorId);
+      if (jugador != null) {
+        jugador.participacion = EstadoParticipacion.abandonado;
+      }
+      final quedanConectados = sala.jugadores.any(
+        (j) =>
+            j.participacion.estaConectadoActivo &&
+            _codigoSalaPorJugador.containsKey(j.id),
+      );
+      if (!quedanConectados) {
+        _eliminarSalaPorCompleto(sala);
+      }
+      return;
+    }
+
     final jugador = sala.jugadorPorId(jugadorId);
     if (jugador != null && jugador.participacion.sigueEnCompetencia) {
       concederPartida(jugadorId: jugadorId);
+    }
+  }
+
+  void _eliminarSalaPorCompleto(_SalaActiva sala) {
+    _salasPorCodigo.remove(sala.codigo);
+    for (final j in sala.jugadores) {
+      _codigoSalaPorJugador.remove(j.id);
     }
   }
 
@@ -648,7 +722,7 @@ class GestorSalas {
       jugador.estaListo = false;
       jugador.ticksGraciaRestantes = _tiempos.segundosGraciaReconexionLobby;
       sala.mensajeEventoReciente =
-          '${jugador.apodo} perdió conexión en el lobby. Esperando reconexión...';
+          '${jugador.apodo} perdió conexión en el lobby. Tiempo para reconectar: ${jugador.ticksGraciaRestantes}s';
       _difundirEstadoSala(sala, excluirJugadorId: jugadorId);
       return;
     }
@@ -657,7 +731,7 @@ class GestorSalas {
       jugador.participacion = EstadoParticipacion.reconectando;
       jugador.ticksGraciaRestantes = _tiempos.segundosGraciaReconexionPartida;
       sala.mensajeEventoReciente =
-          '${jugador.apodo} se desconectó. Tiene ${_tiempos.segundosGraciaReconexionPartida}s para reconectar.';
+          '${jugador.apodo} se desconectó. Tiempo para reconectar: ${jugador.ticksGraciaRestantes}s';
       _difundirEstadoSala(sala, excluirJugadorId: jugadorId);
     }
   }
@@ -683,7 +757,12 @@ class GestorSalas {
         if (j.participacion == EstadoParticipacion.reconectando &&
             j.ticksGraciaRestantes != null) {
           j.ticksGraciaRestantes = j.ticksGraciaRestantes! - 1;
-          if (j.ticksGraciaRestantes! <= 0) {
+          if (j.ticksGraciaRestantes! > 0) {
+            huboCambio = true;
+            sala.mensajeEventoReciente = sala.fase == FaseSala.enLobby
+                ? '${j.apodo} perdió conexión en el lobby. Tiempo para reconectar: ${j.ticksGraciaRestantes}s'
+                : '${j.apodo} se desconectó. Tiempo para reconectar: ${j.ticksGraciaRestantes}s';
+          } else {
             j.ticksGraciaRestantes = null;
             if (sala.fase == FaseSala.enLobby) {
               _codigoSalaPorJugador.remove(j.id);
@@ -727,7 +806,23 @@ class GestorSalas {
       }
 
       if (!_salasPorCodigo.containsKey(codigo)) continue;
-      if (sala.fase == FaseSala.enLobby || sala.fase == FaseSala.finalizada) {
+      if (sala.fase == FaseSala.finalizada) {
+        if (sala.ticksLimpiezaFinalizada != null) {
+          sala.ticksLimpiezaFinalizada = sala.ticksLimpiezaFinalizada! - 1;
+          if (sala.ticksLimpiezaFinalizada! <= 0) {
+            _eliminarSalaPorCompleto(sala);
+            continue;
+          }
+        }
+        if (huboCambio) _difundirEstadoSala(sala);
+        continue;
+      }
+      if (sala.fase == FaseSala.enLobby) {
+        if (huboCambio) _difundirEstadoSala(sala);
+        continue;
+      }
+
+      if (sala.fase == FaseSala.jugandoRondas && sala.esperandoTiroDados) {
         if (huboCambio) _difundirEstadoSala(sala);
         continue;
       }
@@ -815,17 +910,29 @@ class GestorSalas {
   }) {
     sala.fase = FaseSala.jugandoRondas;
     sala.rondaActual = esPrimeraRonda ? 1 : sala.rondaActual + 1;
-    sala.dado1 = _random.nextInt(ConstantesServidor.valorMaximoDado) + 1;
-    sala.dado2 = _random.nextInt(ConstantesServidor.valorMaximoDado) + 1;
-    sala.segundosRestantes = _tiempos.segundosPorRonda;
+    sala.esperandoTiroDados = true;
+    sala.dado1 = null;
+    sala.dado2 = null;
+    sala.segundosRestantes = 0;
     sala.huboJugadaEnRondaActual = false;
 
     for (final j in sala.jugadores) {
       j.confirmoAccionActual = !j.participacion.sigueEnCompetencia;
     }
 
-    sala.mensajeEventoReciente = mensajePrevio ??
-        'Ronda ${sala.rondaActual}: salieron los dados ${sala.dado1} y ${sala.dado2}.';
+    String nombreAnfitrion = 'el anfitrión';
+    for (final j in sala.jugadores) {
+      if (j.esAnfitrion) {
+        nombreAnfitrion = j.apodo;
+        break;
+      }
+    }
+
+    final avisoEspera =
+        'Esperando a que $nombreAnfitrion tire los dados (Ronda ${sala.rondaActual}).';
+    sala.mensajeEventoReciente = mensajePrevio != null
+        ? '$mensajePrevio • $avisoEspera'
+        : avisoEspera;
     _difundirEstadoSala(sala);
   }
 
@@ -878,6 +985,7 @@ class GestorSalas {
 
     if (alcanzoMeta || todosLlenos || agotadoPorInactividad) {
       sala.fase = FaseSala.finalizada;
+      sala.ticksLimpiezaFinalizada = 300;
       sala.segundosRestantes = 0;
       sala.motivoFin = alcanzoMeta
           ? MotivoFinPartida.metaPuntosAlcanzada
@@ -907,7 +1015,7 @@ class GestorSalas {
     final mensajeAviso = prefijoTiempo.isNotEmpty
         ? (resumenEventos != null
             ? '$prefijoTiempo$resumenEventos'
-            : '${prefijoTiempo}Ronda ${sala.rondaActual + 1}: dados ${sala.dado1} y ${sala.dado2}.')
+            : '${prefijoTiempo}Ronda ${sala.rondaActual + 1}.')
         : resumenEventos;
 
     if (porTiempoAgotado) {
@@ -931,6 +1039,7 @@ class GestorSalas {
     final activos = sala.jugadoresEnCompetencia;
     if (activos.length <= 1) {
       sala.fase = FaseSala.finalizada;
+      sala.ticksLimpiezaFinalizada = 300;
       sala.segundosRestantes = 0;
       sala.motivoFin = motivo;
       sala.ganadoresIds = activos.map((j) => j.id).toList();
@@ -963,6 +1072,7 @@ class GestorSalas {
       rondaActual: sala.rondaActual,
       dado1: sala.dado1,
       dado2: sala.dado2,
+      esperandoTiroDados: sala.esperandoTiroDados,
       segundosRestantes: sala.segundosRestantes,
       metaPuntos: sala.metaPuntos,
       misValoresTablero: receptor.tablero.valores,
