@@ -233,8 +233,13 @@ class ServidorWebsocketBrilliant {
 
       if (path == '/auth/sesion' && request.method == 'GET') {
         final token = _extraerBearerToken(request);
-        final usuario =
-            token == null ? null : _gestorUsuarios.obtenerUsuarioPorToken(token);
+        final dispId = request.uri.queryParameters['dispositivoId'];
+        final usuario = token == null
+            ? null
+            : _gestorUsuarios.obtenerUsuarioPorToken(
+                token,
+                dispositivoId: dispId,
+              );
         if (usuario == null) {
           await _responderJson(
             request.response,

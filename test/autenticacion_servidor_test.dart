@@ -322,11 +322,20 @@ void main() {
       // 4. Validar sesión con token activo del celular
       final (statusSes, bodySes) = await _peticionJson(
         metodo: 'GET',
-        uri: Uri.parse('$base/auth/sesion'),
+        uri: Uri.parse('$base/auth/sesion?dispositivoId=disp_celular_1'),
         bearerToken: token,
       );
       expect(statusSes, HttpStatus.ok);
       expect((bodySes['usuario'] as Map)['apodo'], 'JugadorUnico');
+
+      // 4b. Si otra pestaña/dispositivo intenta reutilizar el mismo token -> 409 SESION_YA_ACTIVA
+      final (statusOtraPestana, bodyOtraPestana) = await _peticionJson(
+        metodo: 'GET',
+        uri: Uri.parse('$base/auth/sesion?dispositivoId=disp_pestana_2'),
+        bearerToken: token,
+      );
+      expect(statusOtraPestana, HttpStatus.conflict);
+      expect(bodyOtraPestana['codigo'], 'SESION_YA_ACTIVA');
 
       // 5. Contraseña incorrecta -> 401
       final (statusMalPass, _) = await _peticionJson(

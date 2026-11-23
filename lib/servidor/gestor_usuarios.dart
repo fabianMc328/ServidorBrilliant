@@ -358,7 +358,12 @@ class GestorUsuarios {
   }
 
   /// Devuelve la cuenta asociada a [token] y renueva su latido de actividad, o `null` si expiró/no existe.
-  UsuarioCuenta? obtenerUsuarioPorToken(String token) {
+  /// Si [dispositivoId] pertenece a otra pestaña o dispositivo distinto al dueño del token activo,
+  /// lanza `409 SESION_YA_ACTIVA` para impedir que dos pestañas compartan la misma sesión.
+  UsuarioCuenta? obtenerUsuarioPorToken(
+    String token, {
+    String? dispositivoId,
+  }) {
     final limpio = token.trim();
     if (limpio.isEmpty) return null;
     final sesion = _sesionesPorToken[limpio];
@@ -374,6 +379,21 @@ class GestorUsuarios {
       _sesionesPorToken.remove(limpio);
       _guardarEnDisco();
       return null;
+    }
+
+    final dispLimpio =
+        (dispositivoId != null && dispositivoId.trim().isNotEmpty)
+            ? dispositivoId.trim()
+            : null;
+    if (dispLimpio != null &&
+        sesion.dispositivoId != null &&
+        sesion.dispositivoId != dispLimpio) {
+      throw FalloAutenticacionServidor(
+        statusCode: HttpStatus.conflict,
+        codigo: 'SESION_YA_ACTIVA',
+        mensaje:
+            'La cuenta "${usuario.apodo}" ya está conectada en otra pestaña o dispositivo.',
+      );
     }
 
     sesion.ultimaActividad = DateTime.now().toUtc();
