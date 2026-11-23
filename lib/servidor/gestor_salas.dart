@@ -656,7 +656,7 @@ class GestorSalas {
 
   void _difundirMensajeChat(_SalaActiva sala, MensajeChat mensaje) {
     for (final j in sala.jugadores) {
-      if (!j.participacion.estaConectadoActivo) continue;
+      if (!j.participacion.puedeRecibirEventos) continue;
       _enviarA(
         j.id,
         EventoServidor(
@@ -668,17 +668,22 @@ class GestorSalas {
   }
 
   void salirDeSala({required String jugadorId}) {
-    final codigo = _codigoSalaPorJugador.remove(jugadorId);
+    final codigo = _codigoSalaPorJugador[jugadorId];
     if (codigo == null) return;
     final sala = _salasPorCodigo[codigo];
-    if (sala == null) return;
+    if (sala == null) {
+      _codigoSalaPorJugador.remove(jugadorId);
+      return;
+    }
 
     if (sala.fase == FaseSala.enLobby) {
+      _codigoSalaPorJugador.remove(jugadorId);
       _removerJugadorDeLobby(sala, jugadorId, motivo: 'salió de la sala.');
       return;
     }
 
     if (sala.fase == FaseSala.finalizada) {
+      _codigoSalaPorJugador.remove(jugadorId);
       final jugador = sala.jugadorPorId(jugadorId);
       if (jugador != null) {
         jugador.participacion = EstadoParticipacion.abandonado;
@@ -698,6 +703,7 @@ class GestorSalas {
     if (jugador != null && jugador.participacion.sigueEnCompetencia) {
       concederPartida(jugadorId: jugadorId);
     }
+    _codigoSalaPorJugador.remove(jugadorId);
   }
 
   void _eliminarSalaPorCompleto(_SalaActiva sala) {
@@ -1088,7 +1094,7 @@ class GestorSalas {
   void _difundirEstadoSala(_SalaActiva sala, {String? excluirJugadorId}) {
     for (final j in sala.jugadores) {
       if (j.id == excluirJugadorId) continue;
-      if (!j.participacion.estaConectadoActivo) continue;
+      if (!j.participacion.puedeRecibirEventos) continue;
       _enviarA(
         j.id,
         EventoServidor(

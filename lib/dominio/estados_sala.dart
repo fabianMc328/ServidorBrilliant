@@ -26,6 +26,10 @@ enum EstadoParticipacion {
 
   bool get estaConectadoActivo => this == EstadoParticipacion.conectado;
 
+  bool get puedeRecibirEventos =>
+      this == EstadoParticipacion.conectado ||
+      this == EstadoParticipacion.concedido;
+
   static EstadoParticipacion desdeNombre(String nombre) {
     return EstadoParticipacion.values.firstWhere(
       (e) => e.name == nombre,

@@ -10,6 +10,7 @@ import 'package:servidor_brilliant/dominio/catalogo_esquemas_mapa.dart';
 import 'package:servidor_brilliant/dominio/estado_sala.dart';
 import 'package:servidor_brilliant/dominio/estados_sala.dart';
 import 'package:servidor_brilliant/dominio/mensajes_protocolo.dart';
+import 'package:servidor_brilliant/dominio/modelos_mapa.dart';
 import 'package:servidor_brilliant/servidor/gestor_salas.dart';
 import 'package:servidor_brilliant/servidor/servidor_websocket_brilliant.dart';
 
@@ -366,8 +367,21 @@ void main() {
       expect(ronda2Espera.dado1, isNull);
       expect(ronda2Espera.dado2, isNull);
 
-      // J3 concede -> la partida continúa entre J1 y J2
+      // J3 concede -> J3 también recibe su estado actualizado y la partida continúa entre J1 y J2
       j3.enviarComando(TipoComandoCliente.concederPartida);
+      final trasJ3ParaJ3 = await j3.esperarSala(
+        (s) => s.jugadores.any(
+          (j) =>
+              j.id == s.miJugadorId &&
+              j.participacion == EstadoParticipacion.concedido,
+        ),
+      );
+      expect(
+        trasJ3ParaJ3.jugadores
+            .firstWhere((j) => j.id == trasJ3ParaJ3.miJugadorId)
+            .participacion,
+        EstadoParticipacion.concedido,
+      );
       final trasJ3 = await j1.esperarSala(
         (s) => s.jugadores.any(
           (j) =>
@@ -377,11 +391,15 @@ void main() {
       );
       expect(trasJ3.fase, FaseSala.jugandoRondas);
 
-      // J2 concede -> J1 gana automáticamente
+      // J2 concede -> tanto J1 (ganador) como J2 (quien concedió) reciben FaseSala.finalizada
       j2.enviarComando(TipoComandoCliente.concederPartida);
       final fin = await j1.esperarSala((s) => s.fase == FaseSala.finalizada);
+      final finParaJ2 =
+          await j2.esperarSala((s) => s.fase == FaseSala.finalizada);
       expect(fin.motivoFin, MotivoFinPartida.concesionRival);
       expect(fin.ganadoresIds, [fin.miJugadorId]);
+      expect(finParaJ2.motivoFin, MotivoFinPartida.concesionRival);
+      expect(finParaJ2.ganadoresIds, [fin.miJugadorId]);
     });
 
     test('Desconexión abrupta, reconexión por token de sesión, Host Migration y abandono por expiración', () async {
@@ -532,5 +550,383 @@ void main() {
       );
       expect(estadoCuentaRegresiva.mensajeEventoReciente, contains('2s'));
     });
+
+    test('Partida llena de 6 jugadores: simula rondas completas, reconexión y salirSala activa', () async {
+      final jugadores = <_ClientePruebaWs>[];
+      for (int i = 0; i < 6; i++) {
+        jugadores.add(await nuevoCliente());
+      }
+
+      final evHost = await jugadores.first.enviarConRespuesta(
+        TipoComandoCliente.crearSala,
+        {'apodo': 'Jugador1', 'nivelId': 'nivel_1'},
+      );
+      final codigo = evHost.credencial!.codigoSala;
+
+      for (int i = 1; i < 6; i++) {
+        await jugadores[i].enviarConRespuesta(
+          TipoComandoCliente.unirseSala,
+          {'codigoSala': codigo, 'apodo': 'Jugador${i + 1}'},
+        );
+      }
+
+      // Un 7º jugador debe ser rechazado con salaLlena
+      final j7 = await nuevoCliente();
+      await expectLater(
+        () => j7.enviarConRespuesta(
+          TipoComandoCliente.unirseSala,
+          {'codigoSala': codigo, 'apodo': 'Sobreviviente7'},
+        ),
+        throwsA(
+          isA<FalloMultijugador>().having(
+            (f) => f.codigo,
+            'codigo',
+            CodigoFalloMultijugador.salaLlena,
+          ),
+        ),
+      );
+
+      // Todos pulsan Listo y anfitrión arranca la partida llena (6/6)
+      for (final c in jugadores) {
+        c.enviarComando(TipoComandoCliente.alternarListo, {'listo': true});
+      }
+      await jugadores.first.esperarSala((s) => s.todosListosParaIniciar);
+      jugadores.first.enviarComando(TipoComandoCliente.iniciarPartida);
+
+      for (final c in jugadores) {
+        final s = await c.esperarSala(
+          (st) => st.fase == FaseSala.configurandoIniciales,
+        );
+        expect(s.metaPuntos, ConstantesServidor.metaPuntos5o6Jugadores);
+        expect(s.jugadores.length, 6);
+      }
+
+      // Todos confirman sus 6 estrellas iniciales
+      final estrellas = _estrellasSerializadas('nivel_1');
+      for (final c in jugadores) {
+        c.enviarComando(
+          TipoComandoCliente.confirmarIniciales,
+          {'valoresEstrellas': estrellas},
+        );
+      }
+
+      final mapa = CatalogoEsquemasMapa.porId('nivel_1');
+      bool p6Reconectado = false;
+      bool p5Salio = false;
+      _ClientePruebaWs p6Actual = jugadores[5];
+
+      // Simular rondas completas con jugadas legales hasta finalizar la partida
+      for (int iter = 0; iter < 55; iter++) {
+        final estadoHost = await jugadores.first.esperarSala(
+          (s) =>
+              s.fase == FaseSala.finalizada ||
+              (s.fase == FaseSala.jugandoRondas && s.esperandoTiroDados),
+        );
+        if (estadoHost.fase == FaseSala.finalizada) break;
+
+        final ronda = estadoHost.rondaActual;
+
+        // En ronda 2 probamos caída abrupta y reconexión real de J6
+        if (ronda == 2 && !p6Reconectado) {
+          p6Reconectado = true;
+          final credP6 = p6Actual.credencial!;
+          await p6Actual.socket.close(WebSocketStatus.goingAway);
+          await jugadores.first.esperarSala(
+            (s) => s.jugadores.any(
+              (j) =>
+                  j.id == credP6.jugadorId &&
+                  j.participacion == EstadoParticipacion.reconectando,
+            ),
+          );
+          final nuevoP6 = await nuevoCliente();
+          final evRec = await nuevoP6.enviarConRespuesta(
+            TipoComandoCliente.reconectarSala,
+            {
+              'codigoSala': credP6.codigoSala,
+              'jugadorId': credP6.jugadorId,
+              'tokenSesion': credP6.tokenSesion,
+            },
+          );
+          expect(evRec.estadoSala?.fase, FaseSala.jugandoRondas);
+          p6Actual = nuevoP6;
+        }
+
+        // En ronda 3 probamos salirSala en plena partida activa para J5
+        if (ronda == 3 && !p5Salio) {
+          p5Salio = true;
+          final idP5 = jugadores[4].credencial!.jugadorId;
+          jugadores[4].enviarComando(TipoComandoCliente.salirSala);
+          await jugadores.first.esperarSala(
+            (s) => s.jugadores.any(
+              (j) =>
+                  j.id == idP5 &&
+                  j.participacion == EstadoParticipacion.concedido,
+            ),
+          );
+        }
+
+        // Anfitrión tira los dados obligatorios de esta ronda
+        jugadores.first.enviarComando(TipoComandoCliente.tirarDados);
+
+        final activos = [
+          jugadores[0],
+          jugadores[1],
+          jugadores[2],
+          jugadores[3],
+          if (!p5Salio) jugadores[4],
+          p6Actual,
+        ];
+
+        for (final c in activos) {
+          final st = await c.esperarSala(
+            (s) =>
+                s.fase == FaseSala.finalizada ||
+                (s.rondaActual == ronda &&
+                    !s.esperandoTiroDados &&
+                    s.dado1 != null &&
+                    s.dado2 != null),
+          );
+          if (st.fase == FaseSala.finalizada) break;
+
+          final jugada = _buscarPrimeraJugadaLegal(
+            mapa: mapa,
+            valores: st.misValoresTablero,
+            d1: st.dado1!,
+            d2: st.dado2!,
+          );
+          if (jugada != null) {
+            c.enviarComando(TipoComandoCliente.jugarTurno, {
+              'ronda': ronda,
+              'ancla': jugada.$1.toJson(),
+              'destino': jugada.$2.toJson(),
+              'valorColocado': jugada.$3,
+            });
+          } else {
+            c.enviarComando(TipoComandoCliente.pasarTurno, {'ronda': ronda});
+          }
+        }
+      }
+
+      final fin = await jugadores.first.esperarSala(
+        (s) => s.fase == FaseSala.finalizada,
+      );
+      expect(fin.ganadoresIds, isNotEmpty);
+      expect(p6Reconectado, isTrue);
+      expect(p5Salio, isTrue);
+      expect(
+        fin.jugadores.firstWhere((j) => j.apodo == 'Jugador5').participacion,
+        EstadoParticipacion.concedido,
+      );
+    });
+
+    test('Dos salas multijugador simultáneas en el mismo servidor operan en paralelo sin interferencias', () async {
+      // Sala A: 6 jugadores en nivel_2
+      final salaA = <_ClientePruebaWs>[];
+      for (int i = 0; i < 6; i++) {
+        salaA.add(await nuevoCliente());
+      }
+      final evA = await salaA.first.enviarConRespuesta(
+        TipoComandoCliente.crearSala,
+        {'apodo': 'HostA', 'nivelId': 'nivel_2'},
+      );
+      final codA = evA.credencial!.codigoSala;
+      for (int i = 1; i < 6; i++) {
+        await salaA[i].enviarConRespuesta(
+          TipoComandoCliente.unirseSala,
+          {'codigoSala': codA, 'apodo': 'A_$i'},
+        );
+      }
+
+      // Sala B al mismo tiempo: 4 jugadores en nivel_4
+      final salaB = <_ClientePruebaWs>[];
+      for (int i = 0; i < 4; i++) {
+        salaB.add(await nuevoCliente());
+      }
+      final evB = await salaB.first.enviarConRespuesta(
+        TipoComandoCliente.crearSala,
+        {'apodo': 'HostB', 'nivelId': 'nivel_4'},
+      );
+      final codB = evB.credencial!.codigoSala;
+      expect(codA, isNot(codB));
+      expect(servidor.cantidadSalasActivas, 2);
+
+      for (int i = 1; i < 4; i++) {
+        await salaB[i].enviarConRespuesta(
+          TipoComandoCliente.unirseSala,
+          {'codigoSala': codB, 'apodo': 'B_$i'},
+        );
+      }
+
+      // Chat en Sala A NO debe llegar a Sala B y viceversa
+      final chatEnB = salaB[1].eventos.firstWhere(
+            (e) =>
+                e.tipo == TipoEventoServidor.mensajeChatRecibido &&
+                e.mensajeChat?.texto == 'SoloSalaB',
+          );
+      bool fugasDeChatEnB = false;
+      final subFuga = salaB[1].eventos.listen((e) {
+        if (e.tipo == TipoEventoServidor.mensajeChatRecibido &&
+            e.mensajeChat?.texto == 'SoloSalaA') {
+          fugasDeChatEnB = true;
+        }
+      });
+      addTearDown(subFuga.cancel);
+
+      salaA[0].enviarComando(
+        TipoComandoCliente.enviarMensajeChat,
+        {'texto': 'SoloSalaA'},
+      );
+      salaB[0].enviarComando(
+        TipoComandoCliente.enviarMensajeChat,
+        {'texto': 'SoloSalaB'},
+      );
+      await chatEnB.timeout(const Duration(seconds: 2));
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(fugasDeChatEnB, isFalse);
+
+      // Iniciar ambas salas simultáneamente
+      for (final c in [...salaA, ...salaB]) {
+        c.enviarComando(TipoComandoCliente.alternarListo, {'listo': true});
+      }
+      await salaA.first.esperarSala((s) => s.todosListosParaIniciar);
+      await salaB.first.esperarSala((s) => s.todosListosParaIniciar);
+
+      salaA.first.enviarComando(TipoComandoCliente.iniciarPartida);
+      salaB.first.enviarComando(TipoComandoCliente.iniciarPartida);
+
+      final estA = _estrellasSerializadas('nivel_2');
+      final estB = _estrellasSerializadas('nivel_4');
+
+      for (final c in salaA) {
+        final s = await c.esperarSala(
+          (st) => st.fase == FaseSala.configurandoIniciales,
+        );
+        expect(s.codigoSala, codA);
+        expect(s.nivelId, 'nivel_2');
+        expect(s.metaPuntos, ConstantesServidor.metaPuntos5o6Jugadores);
+        c.enviarComando(
+          TipoComandoCliente.confirmarIniciales,
+          {'valoresEstrellas': estA},
+        );
+      }
+      for (final c in salaB) {
+        final s = await c.esperarSala(
+          (st) => st.fase == FaseSala.configurandoIniciales,
+        );
+        expect(s.codigoSala, codB);
+        expect(s.nivelId, 'nivel_4');
+        expect(s.metaPuntos, ConstantesServidor.metaPuntos4Jugadores);
+        c.enviarComando(
+          TipoComandoCliente.confirmarIniciales,
+          {'valoresEstrellas': estB},
+        );
+      }
+
+      // Ronda 1 simultánea en Sala A y Sala B
+      await salaA.first.esperarSala(
+        (s) => s.fase == FaseSala.jugandoRondas && s.esperandoTiroDados,
+      );
+      await salaB.first.esperarSala(
+        (s) => s.fase == FaseSala.jugandoRondas && s.esperandoTiroDados,
+      );
+
+      salaA.first.enviarComando(TipoComandoCliente.tirarDados);
+      salaB.first.enviarComando(TipoComandoCliente.tirarDados);
+
+      final mapaA = CatalogoEsquemasMapa.porId('nivel_2');
+      final mapaB = CatalogoEsquemasMapa.porId('nivel_4');
+
+      for (final c in salaA) {
+        final st = await c.esperarSala(
+          (s) => s.rondaActual == 1 && !s.esperandoTiroDados,
+        );
+        final jug = _buscarPrimeraJugadaLegal(
+          mapa: mapaA,
+          valores: st.misValoresTablero,
+          d1: st.dado1!,
+          d2: st.dado2!,
+        );
+        if (jug != null) {
+          c.enviarComando(TipoComandoCliente.jugarTurno, {
+            'ronda': 1,
+            'ancla': jug.$1.toJson(),
+            'destino': jug.$2.toJson(),
+            'valorColocado': jug.$3,
+          });
+        } else {
+          c.enviarComando(TipoComandoCliente.pasarTurno, {'ronda': 1});
+        }
+      }
+
+      for (final c in salaB) {
+        final st = await c.esperarSala(
+          (s) => s.rondaActual == 1 && !s.esperandoTiroDados,
+        );
+        final jug = _buscarPrimeraJugadaLegal(
+          mapa: mapaB,
+          valores: st.misValoresTablero,
+          d1: st.dado1!,
+          d2: st.dado2!,
+        );
+        if (jug != null) {
+          c.enviarComando(TipoComandoCliente.jugarTurno, {
+            'ronda': 1,
+            'ancla': jug.$1.toJson(),
+            'destino': jug.$2.toJson(),
+            'valorColocado': jug.$3,
+          });
+        } else {
+          c.enviarComando(TipoComandoCliente.pasarTurno, {'ronda': 1});
+        }
+      }
+
+      final r2A = await salaA.first.esperarSala((s) => s.rondaActual == 2);
+      final r2B = await salaB.first.esperarSala((s) => s.rondaActual == 2);
+      expect(r2A.codigoSala, codA);
+      expect(r2A.jugadores.length, 6);
+      expect(r2B.codigoSala, codB);
+      expect(r2B.jugadores.length, 4);
+      expect(servidor.cantidadSalasActivas, 2);
+    });
   });
+}
+
+(PosicionMapa, PosicionMapa, int)? _buscarPrimeraJugadaLegal({
+  required EsquemaMapa mapa,
+  required Map<PosicionMapa, int> valores,
+  required int d1,
+  required int d2,
+}) {
+  final tablero = TableroServidorJugador(mapa: mapa, valoresIniciales: valores);
+  for (final entry in valores.entries) {
+    final ancla = entry.key;
+    final val = entry.value;
+    if (val == d1) {
+      for (final vecino in tablero.vecinosOrtogonales(ancla)) {
+        if (tablero.esJugadaLegal(
+          ancla: ancla,
+          destino: vecino,
+          dado1: d1,
+          dado2: d2,
+          valorAColocar: d2,
+        )) {
+          return (ancla, vecino, d2);
+        }
+      }
+    }
+    if (val == d2) {
+      for (final vecino in tablero.vecinosOrtogonales(ancla)) {
+        if (tablero.esJugadaLegal(
+          ancla: ancla,
+          destino: vecino,
+          dado1: d1,
+          dado2: d2,
+          valorAColocar: d1,
+        )) {
+          return (ancla, vecino, d1);
+        }
+      }
+    }
+  }
+  return null;
 }
