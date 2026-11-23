@@ -138,12 +138,36 @@ class GestorSalas {
 
   int get cantidadSalasActivas => _salasPorCodigo.length;
 
+  /// Indica si existe algún jugador con ese [apodo] conectado o reconectando en una sala activa.
+  bool tieneJugadorConectadoConApodo(String apodo) {
+    final clave = normalizarApodoClave(apodo);
+    if (clave.isEmpty) return false;
+    for (final sala in _salasPorCodigo.values) {
+      if (sala.fase == FaseSala.finalizada) continue;
+      for (final j in sala.jugadores) {
+        final activo = j.participacion == EstadoParticipacion.conectado ||
+            j.participacion == EstadoParticipacion.reconectando;
+        if (activo && normalizarApodoClave(j.apodo) == clave) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   CredencialSesionSala crearSala({
     required String apodo,
     String nivelId = 'nivel_1',
     String? solicitudId,
   }) {
     final apodoLimpio = _validarYLimpiarApodo(apodo);
+    if (tieneJugadorConectadoConApodo(apodoLimpio)) {
+      throw FalloMultijugador(
+        codigo: CodigoFalloMultijugador.apodoEnUso,
+        mensaje:
+            'La cuenta "$apodoLimpio" ya está conectada en otra sala activa.',
+      );
+    }
     final mapa = CatalogoEsquemasMapa.porIdONull(nivelId);
     if (mapa == null) {
       throw const FalloMultijugador(
@@ -233,6 +257,13 @@ class GestorSalas {
       throw FalloMultijugador(
         codigo: CodigoFalloMultijugador.apodoEnUso,
         mensaje: 'El nombre "$apodoLimpio" ya está en uso dentro de esta sala.',
+      );
+    }
+    if (tieneJugadorConectadoConApodo(apodoLimpio)) {
+      throw FalloMultijugador(
+        codigo: CodigoFalloMultijugador.apodoEnUso,
+        mensaje:
+            'La cuenta "$apodoLimpio" ya está conectada en otra sala activa.',
       );
     }
 

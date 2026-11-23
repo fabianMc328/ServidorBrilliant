@@ -63,6 +63,8 @@ class ServidorWebsocketBrilliant {
       tiempos: _tiempos,
       random: _random,
     );
+    _gestorUsuarios.tieneConexionMultijugadorActiva =
+        (apodo) => _gestor?.tieneJugadorConectadoConApodo(apodo) ?? false;
 
     final bindAddress = direccion ?? InternetAddress.anyIPv4;
     final server = await HttpServer.bind(bindAddress, puerto);
@@ -204,6 +206,7 @@ class ServidorWebsocketBrilliant {
           apodo: (cuerpo['apodo'] as String?) ?? '',
           email: (cuerpo['email'] as String?) ?? '',
           contrasena: (cuerpo['contrasena'] as String?) ?? '',
+          dispositivoId: cuerpo['dispositivoId'] as String?,
         );
         await _responderJson(
           request.response,
@@ -218,6 +221,7 @@ class ServidorWebsocketBrilliant {
         final resultado = _gestorUsuarios.iniciarSesion(
           identificador: (cuerpo['identificador'] as String?) ?? '',
           contrasena: (cuerpo['contrasena'] as String?) ?? '',
+          dispositivoId: cuerpo['dispositivoId'] as String?,
         );
         await _responderJson(
           request.response,

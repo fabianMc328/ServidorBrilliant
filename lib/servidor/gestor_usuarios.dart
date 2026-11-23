@@ -110,6 +110,40 @@ class UsuarioCuenta {
   }
 }
 
+/// Sesión activa asociada a una cuenta para impedir doble conexión simultánea.
+class SesionActivaCuenta {
+  final String token;
+  final String usuarioId;
+  final String? dispositivoId;
+  DateTime ultimaActividad;
+
+  SesionActivaCuenta({
+    required this.token,
+    required this.usuarioId,
+    required this.ultimaActividad,
+    this.dispositivoId,
+  });
+
+  Map<String, dynamic> toStorageJson() => {
+        'token': token,
+        'usuarioId': usuarioId,
+        if (dispositivoId != null) 'dispositivoId': dispositivoId,
+        'ultimaActividad': ultimaActividad.toUtc().toIso8601String(),
+      };
+
+  factory SesionActivaCuenta.fromStorageJson(Map<String, dynamic> json) {
+    return SesionActivaCuenta(
+      token: json['token'] as String,
+      usuarioId: json['usuarioId'] as String,
+      dispositivoId: json['dispositivoId'] as String?,
+      ultimaActividad:
+          DateTime.tryParse(json['ultimaActividad'] as String? ?? '')
+                  ?.toUtc() ??
+              DateTime.now().toUtc(),
+    );
+  }
+}
+
 /// Respuesta pública devuelta al cliente tras iniciar sesión o registrarse.
 class ResultadoAuthServidor {
   final UsuarioCuenta usuario;
@@ -126,7 +160,7 @@ class ResultadoAuthServidor {
       };
 }
 
-/// Gestor autoritativo de cuentas de usuario, sesiones e unicidad global de apodos.
+/// Gestor autoritativo de cuentas de usuario, sesiones únicas e unicidad global de apodos.
 class GestorUsuarios {
   static final RegExp _regexEmail = RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]{2,}$');
   static final RegExp _regexCaracteresProhibidos = RegExp(
@@ -138,14 +172,19 @@ class GestorUsuarios {
 
   final String? _rutaPersistencia;
   final Random _randomSeguro;
+  final Duration duracionInactividadSesion;
+  bool Function(String apodo)? tieneConexionMultijugadorActiva;
+
   final Map<String, UsuarioCuenta> _usuariosPorId = {};
   final Map<String, UsuarioCuenta> _usuariosPorApodoClave = {};
   final Map<String, UsuarioCuenta> _usuariosPorEmail = {};
-  final Map<String, String> _sesionesPorToken = {};
+  final Map<String, SesionActivaCuenta> _sesionesPorToken = {};
 
   GestorUsuarios({
     String? rutaArchivoPersistencia,
     Random? randomSeguro,
+    this.duracionInactividadSesion = const Duration(seconds: 75),
+    this.tieneConexionMultijugadorActiva,
   })  : _rutaPersistencia = rutaArchivoPersistencia,
         _randomSeguro = randomSeguro ?? _crearRandomSeguro() {
     _cargarDesdeDisco();
@@ -166,6 +205,7 @@ class GestorUsuarios {
     required String apodo,
     required String email,
     required String contrasena,
+    String? dispositivoId,
   }) {
     final apodoLimpio = _validarApodo(apodo);
     final apodoClave = normalizarApodoClave(apodoLimpio);
@@ -206,16 +246,21 @@ class GestorUsuarios {
     _usuariosPorApodoClave[apodoClave] = usuario;
     _usuariosPorEmail[emailLimpio] = usuario;
 
-    final token = _crearTokenPara(nuevoId);
+    final token = _crearSesionUnicaPara(
+      nuevoId,
+      dispositivoId: dispositivoId?.trim(),
+    );
     _guardarEnDisco();
 
     return ResultadoAuthServidor(usuario: usuario, token: token);
   }
 
-  /// Inicia sesión usando correo electrónico o apodo único.
+  /// Inicia sesión usando correo electrónico o apodo único y bloquea el acceso si la
+  /// cuenta ya está conectada activamente en otro dispositivo.
   ResultadoAuthServidor iniciarSesion({
     required String identificador,
     required String contrasena,
+    String? dispositivoId,
   }) {
     final limpio = identificador.trim();
     if (limpio.isEmpty) {
@@ -272,28 +317,117 @@ class GestorUsuarios {
       );
     }
 
-    final token = _crearTokenPara(usuario.id);
+    final dispLimpio =
+        (dispositivoId != null && dispositivoId.trim().isNotEmpty)
+            ? dispositivoId.trim()
+            : null;
+
+    final sesionActiva = _obtenerSesionActivaDeUsuario(usuario);
+    if (sesionActiva != null) {
+      final esMismoDispositivo = dispLimpio != null &&
+          sesionActiva.dispositivoId != null &&
+          sesionActiva.dispositivoId == dispLimpio;
+      if (!esMismoDispositivo) {
+        throw const FalloAutenticacionServidor(
+          statusCode: HttpStatus.conflict,
+          codigo: 'SESION_YA_ACTIVA',
+          mensaje:
+              'Esta cuenta ya está conectada en otro dispositivo. Cierra sesión allá antes de entrar.',
+        );
+      }
+    }
+
+    // Si no tenía sesión HTTP pero el apodo está conectado en una sala multijugador activa desde otro cliente
+    if (sesionActiva == null &&
+        (tieneConexionMultijugadorActiva?.call(usuario.apodo) ?? false)) {
+      throw const FalloAutenticacionServidor(
+        statusCode: HttpStatus.conflict,
+        codigo: 'SESION_YA_ACTIVA',
+        mensaje:
+            'Esta cuenta ya tiene una partida o sala activa en otro dispositivo.',
+      );
+    }
+
+    final token = _crearSesionUnicaPara(
+      usuario.id,
+      dispositivoId: dispLimpio,
+    );
     _guardarEnDisco();
 
     return ResultadoAuthServidor(usuario: usuario, token: token);
   }
 
-  /// Devuelve la cuenta asociada a [token], o `null` si no existe.
+  /// Devuelve la cuenta asociada a [token] y renueva su latido de actividad, o `null` si expiró/no existe.
   UsuarioCuenta? obtenerUsuarioPorToken(String token) {
     final limpio = token.trim();
     if (limpio.isEmpty) return null;
-    final usuarioId = _sesionesPorToken[limpio];
-    if (usuarioId == null) return null;
-    return _usuariosPorId[usuarioId];
+    final sesion = _sesionesPorToken[limpio];
+    if (sesion == null) return null;
+
+    final usuario = _usuariosPorId[sesion.usuarioId];
+    if (usuario == null) {
+      _sesionesPorToken.remove(limpio);
+      return null;
+    }
+
+    if (!_sesionSigueVigente(sesion, usuario)) {
+      _sesionesPorToken.remove(limpio);
+      _guardarEnDisco();
+      return null;
+    }
+
+    sesion.ultimaActividad = DateTime.now().toUtc();
+    return usuario;
   }
 
-  /// Revoca un token de sesión activo.
+  /// Revoca un token de sesión activo liberando la cuenta de inmediato.
   void cerrarSesion(String token) {
     final limpio = token.trim();
     if (limpio.isEmpty) return;
     if (_sesionesPorToken.remove(limpio) != null) {
       _guardarEnDisco();
     }
+  }
+
+  bool _sesionSigueVigente(SesionActivaCuenta sesion, UsuarioCuenta usuario) {
+    if (tieneConexionMultijugadorActiva?.call(usuario.apodo) ?? false) {
+      return true;
+    }
+    final transcurrido = DateTime.now().toUtc().difference(sesion.ultimaActividad);
+    return transcurrido <= duracionInactividadSesion;
+  }
+
+  SesionActivaCuenta? _obtenerSesionActivaDeUsuario(UsuarioCuenta usuario) {
+    final tokensExpirados = <String>[];
+    SesionActivaCuenta? activa;
+
+    _sesionesPorToken.forEach((token, sesion) {
+      if (sesion.usuarioId == usuario.id) {
+        if (_sesionSigueVigente(sesion, usuario)) {
+          activa = sesion;
+        } else {
+          tokensExpirados.add(token);
+        }
+      }
+    });
+
+    for (final t in tokensExpirados) {
+      _sesionesPorToken.remove(t);
+    }
+    return activa;
+  }
+
+  String _crearSesionUnicaPara(String usuarioId, {String? dispositivoId}) {
+    _sesionesPorToken.removeWhere((_, s) => s.usuarioId == usuarioId);
+    final token = _generarHexAleatorio(24);
+    _sesionesPorToken[token] = SesionActivaCuenta(
+      token: token,
+      usuarioId: usuarioId,
+      dispositivoId:
+          (dispositivoId != null && dispositivoId.isNotEmpty) ? dispositivoId : null,
+      ultimaActividad: DateTime.now().toUtc(),
+    );
+    return token;
   }
 
   String _validarApodo(String rawApodo) {
@@ -418,12 +552,6 @@ class GestorUsuarios {
     return buffer.toString();
   }
 
-  String _crearTokenPara(String usuarioId) {
-    final token = _generarHexAleatorio(24);
-    _sesionesPorToken[token] = usuarioId;
-    return token;
-  }
-
   void _cargarDesdeDisco() {
     final ruta = _rutaPersistencia;
     if (ruta == null || ruta.trim().isEmpty) return;
@@ -450,13 +578,29 @@ class GestorUsuarios {
         }
       }
 
-      final sesionesJson = decoded['sesiones'];
-      if (sesionesJson is Map<String, dynamic>) {
-        sesionesJson.forEach((token, uid) {
-          if (uid is String && _usuariosPorId.containsKey(uid)) {
-            _sesionesPorToken[token] = uid;
+      final sesionesDetalladas = decoded['sesionesActivas'];
+      if (sesionesDetalladas is List) {
+        for (final item in sesionesDetalladas) {
+          if (item is Map<String, dynamic>) {
+            final sesion = SesionActivaCuenta.fromStorageJson(item);
+            if (_usuariosPorId.containsKey(sesion.usuarioId)) {
+              _sesionesPorToken[sesion.token] = sesion;
+            }
           }
-        });
+        }
+      } else {
+        final sesionesLegado = decoded['sesiones'];
+        if (sesionesLegado is Map<String, dynamic>) {
+          sesionesLegado.forEach((token, uid) {
+            if (uid is String && _usuariosPorId.containsKey(uid)) {
+              _sesionesPorToken[token] = SesionActivaCuenta(
+                token: token,
+                usuarioId: uid,
+                ultimaActividad: DateTime.now().toUtc(),
+              );
+            }
+          });
+        }
       }
     } catch (_) {
       // Si el archivo inicial no puede leerse o está corrupto, inicia limpio sin detener el servidor.
@@ -475,7 +619,8 @@ class GestorUsuarios {
       }
       final datos = jsonEncode({
         'usuarios': _usuariosPorId.values.map((u) => u.toStorageJson()).toList(),
-        'sesiones': _sesionesPorToken,
+        'sesionesActivas':
+            _sesionesPorToken.values.map((s) => s.toStorageJson()).toList(),
       });
       final temporal = File('$ruta.tmp');
       temporal.writeAsStringSync(datos, flush: true);

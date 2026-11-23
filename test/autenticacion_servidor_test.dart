@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:servidor_brilliant/dominio/estados_sala.dart';
+import 'package:servidor_brilliant/servidor/gestor_salas.dart';
 import 'package:servidor_brilliant/servidor/gestor_usuarios.dart';
 import 'package:servidor_brilliant/servidor/servidor_websocket_brilliant.dart';
 import 'package:test/test.dart';
@@ -31,7 +33,7 @@ Future<(int, Map<String, dynamic>)> _peticionJson({
 }
 
 void main() {
-  group('GestorUsuarios y unicidad global de apodos', () {
+  group('GestorUsuarios, sesión única y unicidad global de apodos', () {
     test('Impide registrar dos usuarios con el mismo apodo (mayúsculas, espacios o acentos)', () {
       final gestor = GestorUsuarios();
 
@@ -39,6 +41,7 @@ void main() {
         apodo: 'Fabian',
         email: 'fabian1@correo.com',
         contrasena: 'clave_segura1',
+        dispositivoId: 'disp_pc',
       );
       expect(primero.usuario.apodo, 'Fabian');
       expect(primero.token, isNotEmpty);
@@ -108,7 +111,62 @@ void main() {
       );
     });
 
-    test('Persiste cuentas y tokens en archivo JSON y permite login tras recargar', () {
+    test('Bloquea iniciar sesión desde otro dispositivo si la cuenta ya está conectada', () async {
+      final gestor = GestorUsuarios(
+        duracionInactividadSesion: const Duration(milliseconds: 120),
+      );
+
+      final sesionCelular = gestor.registrarUsuario(
+        apodo: 'Fabian',
+        email: 'fabian@correo.com',
+        contrasena: 'miPassword1',
+        dispositivoId: 'disp_celular',
+      );
+
+      // Intento de entrar desde PC/Web mientras el celular tiene sesión activa -> bloqueado (409 SESION_YA_ACTIVA)
+      expect(
+        () => gestor.iniciarSesion(
+          identificador: 'Fabian',
+          contrasena: 'miPassword1',
+          dispositivoId: 'disp_web',
+        ),
+        throwsA(
+          predicate<FalloAutenticacionServidor>(
+            (e) => e.codigo == 'SESION_YA_ACTIVA' && e.statusCode == 409,
+          ),
+        ),
+      );
+
+      // El MISMO dispositivo (ej. recarga en el mismo celular) sí puede renovar su propia sesión
+      final renovada = gestor.iniciarSesion(
+        identificador: 'Fabian',
+        contrasena: 'miPassword1',
+        dispositivoId: 'disp_celular',
+      );
+      expect(renovada.usuario.apodo, 'Fabian');
+
+      // Al cerrar sesión en el celular, ahora la Web/PC puede entrar de inmediato
+      gestor.cerrarSesion(renovada.token);
+      final sesionWeb = gestor.iniciarSesion(
+        identificador: 'fabian@correo.com',
+        contrasena: 'miPassword1',
+        dispositivoId: 'disp_web',
+      );
+      expect(sesionWeb.token, isNot(sesionCelular.token));
+
+      // Si la Web deja de enviar latido y expira el tiempo de inactividad, otro dispositivo puede entrar
+      await Future<void>.delayed(const Duration(milliseconds: 180));
+      expect(gestor.obtenerUsuarioPorToken(sesionWeb.token), isNull);
+
+      final trasExpiracion = gestor.iniciarSesion(
+        identificador: 'Fabian',
+        contrasena: 'miPassword1',
+        dispositivoId: 'disp_otro',
+      );
+      expect(trasExpiracion.usuario.apodo, 'Fabian');
+    });
+
+    test('Persiste cuentas y tokens en archivo JSON y bloquea doble conexión tras recargar', () {
       final dirTemp = Directory.systemTemp.createTempSync('brilliant_auth_');
       addTearDown(() => dirTemp.deleteSync(recursive: true));
       final archivo = '${dirTemp.path}${Platform.pathSeparator}usuarios.json';
@@ -118,6 +176,7 @@ void main() {
         apodo: 'CarlosPro',
         email: 'carlos@correo.com',
         contrasena: 'miPassword1',
+        dispositivoId: 'disp_1',
       );
 
       // Nuevo gestor leyendo del mismo archivo
@@ -139,15 +198,75 @@ void main() {
         ),
       );
 
-      // Login con apodo (sin distinción de mayúsculas) funciona
+      // Otro dispositivo intenta iniciar sesión mientras disp_1 sigue activo -> bloqueado
+      expect(
+        () => gestor2.iniciarSesion(
+          identificador: 'CARLOSPRO',
+          contrasena: 'miPassword1',
+          dispositivoId: 'disp_2',
+        ),
+        throwsA(
+          predicate<FalloAutenticacionServidor>(
+            (e) => e.codigo == 'SESION_YA_ACTIVA',
+          ),
+        ),
+      );
+
+      // Tras cerrar sesión en disp_1, disp_2 puede iniciar sesión
+      gestor2.cerrarSesion(reg.token);
       final login = gestor2.iniciarSesion(
         identificador: 'CARLOSPRO',
         contrasena: 'miPassword1',
+        dispositivoId: 'disp_2',
       );
       expect(login.usuario.email, 'carlos@correo.com');
     });
 
-    test('Endpoints HTTP /auth/registro, /auth/login, /auth/sesion y /auth/logout end-to-end', () async {
+    test('GestorSalas impide que una misma cuenta cree o se una a otra sala mientras ya está conectada', () {
+      final gestorSalas = GestorSalas(
+        enviarEventoAJugador: (_, __) {},
+      );
+      addTearDown(gestorSalas.cerrar);
+
+      final cred1 = gestorSalas.crearSala(apodo: 'Fabian');
+      expect(gestorSalas.tieneJugadorConectadoConApodo('fabian'), isTrue);
+
+      // No puede crear una segunda sala con la misma cuenta activa
+      expect(
+        () => gestorSalas.crearSala(apodo: 'FABIAN'),
+        throwsA(
+          predicate<FalloMultijugador>(
+            (f) => f.codigo == CodigoFalloMultijugador.apodoEnUso,
+          ),
+        ),
+      );
+
+      // Tampoco puede unirse a otra sala mientras sigue en la primera
+      final credOtraSala = gestorSalas.crearSala(apodo: 'Anfitrion2');
+      expect(
+        () => gestorSalas.unirseASala(
+          codigoSala: credOtraSala.codigoSala,
+          apodo: 'Fabián',
+        ),
+        throwsA(
+          predicate<FalloMultijugador>(
+            (f) => f.codigo == CodigoFalloMultijugador.apodoEnUso,
+          ),
+        ),
+      );
+
+      // Al salir de la primera sala, queda libre para unirse a la segunda
+      gestorSalas.salirDeSala(jugadorId: cred1.jugadorId);
+      expect(gestorSalas.tieneJugadorConectadoConApodo('Fabian'), isFalse);
+
+      final unido = gestorSalas.unirseASala(
+        codigoSala: credOtraSala.codigoSala,
+        apodo: 'Fabian',
+      );
+      expect(unido.apodo, 'Fabian');
+    });
+
+    test('Endpoints HTTP /auth/registro, /auth/login (bloqueo doble sesión), /auth/sesion y /auth/logout end-to-end', () async {
       final servidor = ServidorWebsocketBrilliant(persistirUsuarios: false);
       final puerto = await servidor.iniciar(
         direccion: InternetAddress.loopbackIPv4,
@@ -157,14 +276,15 @@ void main() {
 
       final base = 'http://127.0.0.1:$puerto';
 
-      // 1. Registro del primer dispositivo (PC)
+      // 1. Registro del primer dispositivo (Celular)
       final (statusReg1, bodyReg1) = await _peticionJson(
         metodo: 'POST',
         uri: Uri.parse('$base/auth/registro'),
         body: {
           'apodo': 'JugadorUnico',
-          'email': 'pc@correo.com',
-          'contrasena': 'clavePC123',
+          'email': 'cel@correo.com',
+          'contrasena': 'claveCel123',
+          'dispositivoId': 'disp_celular_1',
         },
       );
       expect(statusReg1, HttpStatus.created);
@@ -172,20 +292,34 @@ void main() {
       final token = bodyReg1['token'] as String;
       expect(token, isNotEmpty);
 
-      // 2. Segundo dispositivo (Celular) intenta registrarse con el mismo apodo -> 409
+      // 2. Segundo dispositivo (Web) intenta registrarse con el mismo apodo -> 409 APODO_EN_USO
       final (statusDup, bodyDup) = await _peticionJson(
         metodo: 'POST',
         uri: Uri.parse('$base/auth/registro'),
         body: {
           'apodo': 'jugadorunico',
-          'email': 'cel@correo.com',
-          'contrasena': 'claveCel123',
+          'email': 'web@correo.com',
+          'contrasena': 'claveWeb123',
+          'dispositivoId': 'disp_web_2',
         },
       );
       expect(statusDup, HttpStatus.conflict);
       expect(bodyDup['codigo'], 'APODO_EN_USO');
 
-      // 3. Validar sesión con token
+      // 3. Segundo dispositivo (Web) intenta hacer LOGIN con esa cuenta ya conectada -> 409 SESION_YA_ACTIVA
+      final (statusDobleLogin, bodyDobleLogin) = await _peticionJson(
+        metodo: 'POST',
+        uri: Uri.parse('$base/auth/login'),
+        body: {
+          'identificador': 'JugadorUnico',
+          'contrasena': 'claveCel123',
+          'dispositivoId': 'disp_web_2',
+        },
+      );
+      expect(statusDobleLogin, HttpStatus.conflict);
+      expect(bodyDobleLogin['codigo'], 'SESION_YA_ACTIVA');
+
+      // 4. Validar sesión con token activo del celular
       final (statusSes, bodySes) = await _peticionJson(
         metodo: 'GET',
         uri: Uri.parse('$base/auth/sesion'),
@@ -194,18 +328,19 @@ void main() {
       expect(statusSes, HttpStatus.ok);
       expect((bodySes['usuario'] as Map)['apodo'], 'JugadorUnico');
 
-      // 4. Contraseña incorrecta -> 401
+      // 5. Contraseña incorrecta -> 401
       final (statusMalPass, _) = await _peticionJson(
         metodo: 'POST',
         uri: Uri.parse('$base/auth/login'),
         body: {
           'identificador': 'JugadorUnico',
           'contrasena': 'incorrecta',
+          'dispositivoId': 'disp_celular_1',
         },
       );
       expect(statusMalPass, HttpStatus.unauthorized);
 
-      // 5. Logout revoca el token
+      // 6. Logout en celular libera la cuenta para que Web ahora sí pueda entrar
       final (statusOut, _) = await _peticionJson(
         metodo: 'POST',
         uri: Uri.parse('$base/auth/logout'),
@@ -219,6 +354,18 @@ void main() {
         bearerToken: token,
       );
       expect(statusSesPostOut, HttpStatus.unauthorized);
+
+      final (statusLoginWeb, bodyLoginWeb) = await _peticionJson(
+        metodo: 'POST',
+        uri: Uri.parse('$base/auth/login'),
+        body: {
+          'identificador': 'JugadorUnico',
+          'contrasena': 'claveCel123',
+          'dispositivoId': 'disp_web_2',
+        },
+      );
+      expect(statusLoginWeb, HttpStatus.ok);
+      expect((bodyLoginWeb['usuario'] as Map)['apodo'], 'JugadorUnico');
     });
   });
 }
