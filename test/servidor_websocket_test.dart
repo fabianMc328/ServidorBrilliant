@@ -888,6 +888,180 @@ void main() {
       expect(r2B.jugadores.length, 4);
       expect(servidor.cantidadSalasActivas, 2);
     });
+
+    test('Simulación real de partidas de 2, 3, 4, 5 y 6 jugadores en salas simultáneas con movimientos y rendiciones', () async {
+      final metasEsperadas = {2: 26, 3: 24, 4: 22, 5: 20, 6: 20};
+      final mapasCiclo = ['nivel_1', 'nivel_2', 'nivel_3', 'nivel_4', 'nivel_1'];
+      final salasSimultaneas = <int, List<_ClientePruebaWs>>{};
+      final codigosPorTamano = <int, String>{};
+
+      // 1. Crear 5 salas simultáneas en el mismo servidor (de 2, 3, 4, 5 y 6 jugadores)
+      var idxMapa = 0;
+      for (final cantJugadores in [2, 3, 4, 5, 6]) {
+        final nivelId = mapasCiclo[idxMapa++];
+        final clientesSala = <_ClientePruebaWs>[];
+        for (int i = 0; i < cantJugadores; i++) {
+          clientesSala.add(await nuevoCliente());
+        }
+
+        final evHost = await clientesSala.first.enviarConRespuesta(
+          TipoComandoCliente.crearSala,
+          {'apodo': 'S${cantJugadores}_J1', 'nivelId': nivelId},
+        );
+        final codigo = evHost.credencial!.codigoSala;
+        codigosPorTamano[cantJugadores] = codigo;
+
+        for (int i = 1; i < cantJugadores; i++) {
+          await clientesSala[i].enviarConRespuesta(
+            TipoComandoCliente.unirseSala,
+            {'codigoSala': codigo, 'apodo': 'S${cantJugadores}_J${i + 1}'},
+          );
+        }
+
+        for (final c in clientesSala) {
+          c.enviarComando(TipoComandoCliente.alternarListo, {'listo': true});
+        }
+        await clientesSala.first.esperarSala((s) => s.todosListosParaIniciar);
+        clientesSala.first.enviarComando(TipoComandoCliente.iniciarPartida);
+
+        final estadoIni = await clientesSala.first.esperarSala(
+          (s) => s.fase == FaseSala.configurandoIniciales,
+        );
+        expect(estadoIni.metaPuntos, metasEsperadas[cantJugadores]);
+        salasSimultaneas[cantJugadores] = clientesSala;
+      }
+
+      expect(servidor.cantidadSalasActivas, 5);
+
+      // 2. En la sala de 5 jugadores, el jugador 5 se rinde durante la fase de estrellas iniciales
+      salasSimultaneas[5]![4].enviarComando(TipoComandoCliente.concederPartida);
+      await salasSimultaneas[5]!.first.esperarSala(
+        (s) => s.jugadores.any(
+          (j) =>
+              j.apodo == 'S5_J5' &&
+              j.participacion == EstadoParticipacion.concedido,
+        ),
+      );
+
+      // Todos los jugadores activos de las 5 salas confirman sus estrellas iniciales
+      idxMapa = 0;
+      for (final cantJugadores in [2, 3, 4, 5, 6]) {
+        final nivelId = mapasCiclo[idxMapa++];
+        final estrellas = _estrellasSerializadas(nivelId);
+        final clientes = salasSimultaneas[cantJugadores]!;
+        for (int i = 0; i < clientes.length; i++) {
+          if (cantJugadores == 5 && i == 4) continue; // ya concedió
+          clientes[i].enviarComando(
+            TipoComandoCliente.confirmarIniciales,
+            {'valoresEstrellas': estrellas},
+          );
+        }
+      }
+
+      // 3. Todas las salas pasan a Ronda 1 esperando tiro de dados
+      for (final cantJugadores in [2, 3, 4, 5, 6]) {
+        final st = await salasSimultaneas[cantJugadores]!.first.esperarSala(
+          (s) => s.fase == FaseSala.jugandoRondas && s.rondaActual == 1,
+        );
+        expect(st.esperandoTiroDados, isTrue);
+      }
+
+      // 4. En la sala de 4 jugadores, el ANFITRIÓN (S4_J1) se rinde antes de tirar los dados ->
+      //    S4_J2 hereda el rol de anfitrión, el banner lo anuncia y tira los dados sin bloquear la sala
+      salasSimultaneas[4]!.first.enviarComando(TipoComandoCliente.concederPartida);
+      final stNuevoHost4 = await salasSimultaneas[4]![1].esperarSala(
+        (s) => s.soyAnfitrion && s.esperandoTiroDados,
+      );
+      expect(
+        stNuevoHost4.jugadores.firstWhere((j) => j.esAnfitrion).apodo,
+        'S4_J2',
+      );
+      expect(
+        stNuevoHost4.mensajeEventoReciente,
+        contains('S4_J2 es el nuevo anfitrión y debe tirar los dados'),
+      );
+
+      // 5. Jugar 3 rondas reales en todas las salas simultáneamente
+      idxMapa = 0;
+      for (final cantJugadores in [2, 3, 4, 5, 6]) {
+        final nivelId = mapasCiclo[idxMapa++];
+        final mapa = CatalogoEsquemasMapa.porId(nivelId);
+        final clientes = salasSimultaneas[cantJugadores]!;
+
+        for (int ronda = 1; ronda <= 3; ronda++) {
+          final indiceHostActual = cantJugadores == 4 ? 1 : 0;
+          clientes[indiceHostActual].enviarComando(TipoComandoCliente.tirarDados);
+
+          for (int i = 0; i < clientes.length; i++) {
+            if (cantJugadores == 5 && i == 4) continue;
+            if (cantJugadores == 4 && i == 0) continue;
+
+            final st = await clientes[i].esperarSala(
+              (s) => s.rondaActual == ronda && !s.esperandoTiroDados,
+            );
+            final jugada = _buscarPrimeraJugadaLegal(
+              mapa: mapa,
+              valores: st.misValoresTablero,
+              d1: st.dado1!,
+              d2: st.dado2!,
+            );
+            if (jugada != null) {
+              clientes[i].enviarComando(TipoComandoCliente.jugarTurno, {
+                'ronda': ronda,
+                'ancla': jugada.$1.toJson(),
+                'destino': jugada.$2.toJson(),
+                'valorColocado': jugada.$3,
+              });
+            } else {
+              clientes[i].enviarComando(
+                TipoComandoCliente.pasarTurno,
+                {'ronda': ronda},
+              );
+            }
+          }
+
+          final sig = await clientes[indiceHostActual].esperarSala(
+            (s) => s.rondaActual == ronda + 1 || s.fase == FaseSala.finalizada,
+          );
+          expect(sig.rondaActual, ronda + 1);
+        }
+      }
+
+      // 6. En la sala de 2 jugadores, S2_J2 se rinde -> S2_J1 gana inmediatamente y ambos reciben finalizada
+      salasSimultaneas[2]![1].enviarComando(TipoComandoCliente.concederPartida);
+      final finS2Host = await salasSimultaneas[2]!.first.esperarSala(
+        (s) => s.fase == FaseSala.finalizada,
+      );
+      final finS2Rend = await salasSimultaneas[2]![1].esperarSala(
+        (s) => s.fase == FaseSala.finalizada,
+      );
+      expect(finS2Host.motivoFin, MotivoFinPartida.concesionRival);
+      expect(finS2Rend.motivoFin, MotivoFinPartida.concesionRival);
+
+      // 7. En la sala de 3 jugadores, tiran dados en Ronda 4, J1 y J2 juegan, y J3 (el único que faltaba)
+      //    se rinde a mitad de ronda -> la ronda se cierra al instante y pasa a Ronda 5 entre J1 y J2
+      salasSimultaneas[3]!.first.enviarComando(TipoComandoCliente.tirarDados);
+      for (int i = 0; i < 2; i++) {
+        await salasSimultaneas[3]![i].esperarSala(
+          (s) => s.rondaActual == 4 && !s.esperandoTiroDados,
+        );
+        salasSimultaneas[3]![i].enviarComando(
+          TipoComandoCliente.pasarTurno,
+          {'ronda': 4},
+        );
+      }
+      await salasSimultaneas[3]![2].esperarSala(
+        (s) => s.rondaActual == 4 && !s.esperandoTiroDados,
+      );
+      salasSimultaneas[3]![2].enviarComando(TipoComandoCliente.concederPartida);
+      final r5S3 = await salasSimultaneas[3]!.first.esperarSala(
+        (s) => s.rondaActual == 5 && s.esperandoTiroDados,
+      );
+      expect(
+        r5S3.jugadores.where((j) => j.participacion.sigueEnCompetencia).length,
+        2,
+      );
+    });
   });
 }
 

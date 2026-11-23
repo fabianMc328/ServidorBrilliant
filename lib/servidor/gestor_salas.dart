@@ -138,21 +138,61 @@ class GestorSalas {
 
   int get cantidadSalasActivas => _salasPorCodigo.length;
 
-  /// Indica si existe algún jugador con ese [apodo] conectado o reconectando en una sala activa.
+  /// Indica si existe algún jugador con ese [apodo] conectado activamente en una sala en curso.
   bool tieneJugadorConectadoConApodo(String apodo) {
     final clave = normalizarApodoClave(apodo);
     if (clave.isEmpty) return false;
     for (final sala in _salasPorCodigo.values) {
       if (sala.fase == FaseSala.finalizada) continue;
       for (final j in sala.jugadores) {
-        final activo = j.participacion == EstadoParticipacion.conectado ||
-            j.participacion == EstadoParticipacion.reconectando;
-        if (activo && normalizarApodoClave(j.apodo) == clave) {
+        if (j.participacion == EstadoParticipacion.conectado &&
+            normalizarApodoClave(j.apodo) == clave) {
           return true;
         }
       }
     }
     return false;
+  }
+
+  /// Si el jugador recargó la página (F5) o cerró la app y su sesión anterior quedó en
+  /// estado `reconectando`, limpia ese lugar fantasma para que pueda crear o unirse sin esperar 30s.
+  void _limpiarSesionesEnReconexionPorApodo(
+    String apodo, {
+    String? preservarSalaCodigo,
+  }) {
+    final clave = normalizarApodoClave(apodo);
+    if (clave.isEmpty) return;
+
+    final codigos = _salasPorCodigo.keys.toList();
+    for (final codigo in codigos) {
+      final sala = _salasPorCodigo[codigo];
+      if (sala == null) continue;
+
+      final fantasmas = sala.jugadores
+          .where(
+            (j) =>
+                j.participacion == EstadoParticipacion.reconectando &&
+                normalizarApodoClave(j.apodo) == clave,
+          )
+          .toList();
+
+      for (final fantasma in fantasmas) {
+        if (sala.fase == FaseSala.enLobby &&
+            sala.codigo == preservarSalaCodigo) {
+          _codigoSalaPorJugador.remove(fantasma.id);
+          sala.jugadores.removeWhere((j) => j.id == fantasma.id);
+          if (fantasma.esAnfitrion && sala.jugadores.isNotEmpty) {
+            final nuevoHost = sala.jugadores.firstWhere(
+              (j) => j.participacion.estaConectadoActivo,
+              orElse: () => sala.jugadores.first,
+            );
+            nuevoHost.esAnfitrion = true;
+          }
+        } else {
+          salirDeSala(jugadorId: fantasma.id);
+        }
+      }
+    }
   }
 
   CredencialSesionSala crearSala({
@@ -161,6 +201,7 @@ class GestorSalas {
     String? solicitudId,
   }) {
     final apodoLimpio = _validarYLimpiarApodo(apodo);
+    _limpiarSesionesEnReconexionPorApodo(apodoLimpio);
     if (tieneJugadorConectadoConApodo(apodoLimpio)) {
       throw FalloMultijugador(
         codigo: CodigoFalloMultijugador.apodoEnUso,
@@ -241,6 +282,12 @@ class GestorSalas {
       );
     }
 
+    final apodoLimpio = _validarYLimpiarApodo(apodo);
+    _limpiarSesionesEnReconexionPorApodo(
+      apodoLimpio,
+      preservarSalaCodigo: sala.codigo,
+    );
+
     if (sala.jugadores.length >= ConstantesServidor.maxJugadoresSala) {
       throw const FalloMultijugador(
         codigo: CodigoFalloMultijugador.salaLlena,
@@ -248,7 +295,6 @@ class GestorSalas {
       );
     }
 
-    final apodoLimpio = _validarYLimpiarApodo(apodo);
     final apodoClave = normalizarApodoClave(apodoLimpio);
     final repetido = sala.jugadores.any(
       (j) => normalizarApodoClave(j.apodo) == apodoClave,
@@ -267,11 +313,12 @@ class GestorSalas {
       );
     }
 
+    final eraSalaVacia = sala.jugadores.isEmpty;
     final jugador = _EstadoInternoJugador(
       id: _nuevoJugadorId(),
       tokenSesion: _nuevoTokenSesion(),
       apodo: apodoLimpio,
-      esAnfitrion: false,
+      esAnfitrion: eraSalaVacia,
       mapaInicial: sala.mapa,
     );
 
@@ -626,6 +673,13 @@ class GestorSalas {
           orElse: () => enComp.first,
         );
         nuevoHost.esAnfitrion = true;
+        if (sala.fase == FaseSala.jugandoRondas && sala.esperandoTiroDados) {
+          sala.mensajeEventoReciente =
+              '${jugador.apodo} ha concedido la partida. ${nuevoHost.apodo} es el nuevo anfitrión y debe tirar los dados (Ronda ${sala.rondaActual}).';
+        } else {
+          sala.mensajeEventoReciente =
+              '${jugador.apodo} ha concedido la partida. ${nuevoHost.apodo} es ahora el nuevo anfitrión.';
+        }
         _emitirMensajeSistema(
           sala.codigo,
           '${nuevoHost.apodo} es ahora el nuevo anfitrión.',
@@ -721,12 +775,7 @@ class GestorSalas {
       if (jugador != null) {
         jugador.participacion = EstadoParticipacion.abandonado;
       }
-      final quedanConectados = sala.jugadores.any(
-        (j) =>
-            j.participacion.estaConectadoActivo &&
-            _codigoSalaPorJugador.containsKey(j.id),
-      );
-      if (!quedanConectados) {
+      if (!_tieneAlgunJugadorConSocket(sala)) {
         _eliminarSalaPorCompleto(sala);
       }
       return;
@@ -737,6 +786,18 @@ class GestorSalas {
       concederPartida(jugadorId: jugadorId);
     }
     _codigoSalaPorJugador.remove(jugadorId);
+    if (!_tieneAlgunJugadorConSocket(sala)) {
+      _eliminarSalaPorCompleto(sala);
+    }
+  }
+
+  bool _tieneAlgunJugadorConSocket(_SalaActiva sala) {
+    return sala.jugadores.any(
+      (j) =>
+          (j.participacion == EstadoParticipacion.conectado ||
+              j.participacion == EstadoParticipacion.reconectando) &&
+          _codigoSalaPorJugador.containsKey(j.id),
+    );
   }
 
   void _eliminarSalaPorCompleto(_SalaActiva sala) {
@@ -754,7 +815,14 @@ class GestorSalas {
     final jugador = sala.jugadorPorId(jugadorId);
     if (jugador == null) return;
 
-    if (sala.fase == FaseSala.finalizada) return;
+    if (sala.fase == FaseSala.finalizada) {
+      _codigoSalaPorJugador.remove(jugadorId);
+      jugador.participacion = EstadoParticipacion.abandonado;
+      if (!_tieneAlgunJugadorConSocket(sala)) {
+        _eliminarSalaPorCompleto(sala);
+      }
+      return;
+    }
 
     if (sala.fase == FaseSala.enLobby) {
       jugador.participacion = EstadoParticipacion.reconectando;
@@ -792,6 +860,8 @@ class GestorSalas {
       bool huboCambio = false;
 
       final copiaJugadores = List<_EstadoInternoJugador>.from(sala.jugadores);
+      final expiradosEnTick = <_EstadoInternoJugador>[];
+
       for (final j in copiaJugadores) {
         if (j.participacion == EstadoParticipacion.reconectando &&
             j.ticksGraciaRestantes != null) {
@@ -803,44 +873,67 @@ class GestorSalas {
                 : '${j.apodo} se desconectó. Tiempo para reconectar: ${j.ticksGraciaRestantes}s';
           } else {
             j.ticksGraciaRestantes = null;
-            if (sala.fase == FaseSala.enLobby) {
-              _codigoSalaPorJugador.remove(j.id);
-              _removerJugadorDeLobby(
-                sala,
-                j.id,
-                motivo: 'se desconectó del lobby.',
-              );
-              huboCambio = false;
-            } else if (sala.fase != FaseSala.finalizada) {
-              j.participacion = EstadoParticipacion.abandonado;
-              j.confirmoAccionActual = true;
-              if (j.esAnfitrion) {
-                j.esAnfitrion = false;
-                final enComp = sala.jugadoresEnCompetencia;
-                if (enComp.isNotEmpty) {
-                  final nuevoHost = enComp.firstWhere(
-                    (c) => c.participacion.estaConectadoActivo,
-                    orElse: () => enComp.first,
-                  );
-                  nuevoHost.esAnfitrion = true;
-                  _emitirMensajeSistema(
-                    sala.codigo,
-                    'El anfitrión ${j.apodo} abandonó la partida. ${nuevoHost.apodo} es ahora el nuevo anfitrión.',
-                  );
-                }
-              }
-              sala.mensajeEventoReciente =
-                  '${j.apodo} abandonó la partida por desconexión.';
-              if (_verificarFinPorUnicoSobreviviente(
-                sala,
-                motivo: MotivoFinPartida.abandonoRival,
-              )) {
-                huboCambio = false;
-                break;
-              }
-              huboCambio = true;
+            expiradosEnTick.add(j);
+          }
+        }
+      }
+
+      if (expiradosEnTick.isNotEmpty) {
+        if (sala.fase == FaseSala.enLobby) {
+          for (final j in expiradosEnTick) {
+            _codigoSalaPorJugador.remove(j.id);
+            _removerJugadorDeLobby(
+              sala,
+              j.id,
+              motivo: 'se desconectó del lobby.',
+            );
+          }
+          huboCambio = false;
+        } else if (sala.fase != FaseSala.finalizada) {
+          bool expiroAnfitrion = false;
+          String ultimoApodoExpirado = expiradosEnTick.last.apodo;
+          for (final j in expiradosEnTick) {
+            _codigoSalaPorJugador.remove(j.id);
+            j.participacion = EstadoParticipacion.abandonado;
+            j.confirmoAccionActual = true;
+            if (j.esAnfitrion) {
+              j.esAnfitrion = false;
+              expiroAnfitrion = true;
             }
           }
+
+          if (sala.jugadoresEnCompetencia.isEmpty) {
+            _eliminarSalaPorCompleto(sala);
+            continue;
+          }
+
+          if (expiroAnfitrion) {
+            final enComp = sala.jugadoresEnCompetencia;
+            if (enComp.isNotEmpty) {
+              final nuevoHost = enComp.firstWhere(
+                (c) => c.participacion.estaConectadoActivo,
+                orElse: () => enComp.first,
+              );
+              nuevoHost.esAnfitrion = true;
+              _emitirMensajeSistema(
+                sala.codigo,
+                'El anfitrión abandonó la partida. ${nuevoHost.apodo} es ahora el nuevo anfitrión.',
+              );
+            }
+          }
+
+          sala.mensajeEventoReciente =
+              '$ultimoApodoExpirado abandonó la partida por desconexión.';
+          if (_verificarFinPorUnicoSobreviviente(
+            sala,
+            motivo: MotivoFinPartida.abandonoRival,
+          )) {
+            if (!_tieneAlgunJugadorConSocket(sala)) {
+              _eliminarSalaPorCompleto(sala);
+            }
+            continue;
+          }
+          huboCambio = true;
         }
       }
 

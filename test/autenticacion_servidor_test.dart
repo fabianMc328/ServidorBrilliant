@@ -264,6 +264,15 @@ void main() {
         apodo: 'Fabian',
       );
       expect(unido.apodo, 'Fabian');
+
+      // Si recarga la página (F5) y su socket anterior queda en 'reconectando',
+      // puede volver a unirse a la misma sala de inmediato sin esperar 30 segundos
+      gestorSalas.notificarDesconexionAbrupta(unido.jugadorId);
+      final reingresoInmediato = gestorSalas.unirseASala(
+        codigoSala: credOtraSala.codigoSala,
+        apodo: 'Fabian',
+      );
+      expect(reingresoInmediato.apodo, 'Fabian');
     });
 
     test('Endpoints HTTP /auth/registro, /auth/login (bloqueo doble sesión), /auth/sesion y /auth/logout end-to-end', () async {
