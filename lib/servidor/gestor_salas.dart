@@ -9,6 +9,7 @@ import '../dominio/jugador_sala.dart';
 import '../dominio/mensajes_protocolo.dart';
 import '../dominio/modelos_mapa.dart';
 import '../dominio/motor_puntuacion_carrera.dart';
+import 'gestor_usuarios.dart';
 
 /// Configuración inyectable de temporizadores del servidor (facilita pruebas rápidas).
 class ConfiguracionTiemposServidor {
@@ -224,8 +225,9 @@ class GestorSalas {
     }
 
     final apodoLimpio = _validarYLimpiarApodo(apodo);
+    final apodoClave = normalizarApodoClave(apodoLimpio);
     final repetido = sala.jugadores.any(
-      (j) => j.apodo.toLowerCase() == apodoLimpio.toLowerCase(),
+      (j) => normalizarApodoClave(j.apodo) == apodoClave,
     );
     if (repetido) {
       throw FalloMultijugador(

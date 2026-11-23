@@ -19,7 +19,7 @@ Future<void> main(List<String> args) async {
     }
   }
 
-  final servidor = ServidorWebsocketBrilliant();
+  final servidor = ServidorWebsocketBrilliant(persistirUsuarios: true);
   final puertoActivo = await servidor.iniciar(puerto: puerto);
 
   stdout.writeln('=====================================================');

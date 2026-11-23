@@ -8,12 +8,14 @@ import '../dominio/estados_sala.dart';
 import '../dominio/mensajes_protocolo.dart';
 import '../dominio/modelos_mapa.dart';
 import 'gestor_salas.dart';
+import 'gestor_usuarios.dart';
 
 /// Servidor WebSocket autoritativo en Dart puro para partidas de hasta 6 jugadores.
 class ServidorWebsocketBrilliant {
   final ConfiguracionTiemposServidor _tiempos;
   final Duration _pingInterval;
   final Random? _random;
+  final GestorUsuarios _gestorUsuarios;
 
   HttpServer? _httpServer;
   RawDatagramSocket? _udpDescubrimiento;
@@ -26,9 +28,20 @@ class ServidorWebsocketBrilliant {
     ConfiguracionTiemposServidor tiempos = const ConfiguracionTiemposServidor(),
     Duration pingInterval = ConstantesServidor.intervaloHeartbeat,
     Random? random,
+    GestorUsuarios? gestorUsuarios,
+    bool persistirUsuarios = false,
   })  : _tiempos = tiempos,
         _pingInterval = pingInterval,
-        _random = random;
+        _random = random,
+        _gestorUsuarios = gestorUsuarios ??
+            GestorUsuarios(
+              rutaArchivoPersistencia: persistirUsuarios
+                  ? (Platform.environment['BRILLIANT_RUTA_USUARIOS'] ??
+                      'datos/usuarios.json')
+                  : null,
+            );
+
+  GestorUsuarios get gestorUsuarios => _gestorUsuarios;
 
   bool get estaActivo => _httpServer != null;
 
@@ -130,19 +143,31 @@ class ServidorWebsocketBrilliant {
   }
 
   Future<void> _manejarPeticionHttp(HttpRequest request) async {
+    _aplicarCabecerasCors(request.response);
+
+    if (request.method == 'OPTIONS') {
+      request.response.statusCode = HttpStatus.noContent;
+      await request.response.close();
+      return;
+    }
+
     if (request.uri.path == '/salud') {
-      request.response.statusCode = HttpStatus.ok;
-      request.response.headers.contentType = ContentType.json;
-      request.response.headers.set('Access-Control-Allow-Origin', '*');
-      request.response.write(
-        jsonEncode({
+      await _responderJson(
+        request.response,
+        HttpStatus.ok,
+        {
           'servicio': 'servidorBrilliant',
           'estado': 'ok',
           'puerto': puertoEscucha,
           'salasActivas': cantidadSalasActivas,
-        }),
+          'usuariosRegistrados': _gestorUsuarios.cantidadUsuarios,
+        },
       );
-      await request.response.close();
+      return;
+    }
+
+    if (request.uri.path.startsWith('/auth/')) {
+      await _manejarPeticionAuth(request);
       return;
     }
 
@@ -158,6 +183,147 @@ class ServidorWebsocketBrilliant {
       socket.pingInterval = _pingInterval;
       _registrarConexion(socket);
     } catch (_) {}
+  }
+
+  void _aplicarCabecerasCors(HttpResponse response) {
+    response.headers.set('Access-Control-Allow-Origin', '*');
+    response.headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    response.headers.set(
+      'Access-Control-Allow-Headers',
+      'Content-Type, Authorization',
+    );
+  }
+
+  Future<void> _manejarPeticionAuth(HttpRequest request) async {
+    final path = request.uri.path;
+
+    try {
+      if (path == '/auth/registro' && request.method == 'POST') {
+        final cuerpo = await _leerJsonBody(request);
+        final resultado = _gestorUsuarios.registrarUsuario(
+          apodo: (cuerpo['apodo'] as String?) ?? '',
+          email: (cuerpo['email'] as String?) ?? '',
+          contrasena: (cuerpo['contrasena'] as String?) ?? '',
+        );
+        await _responderJson(
+          request.response,
+          HttpStatus.created,
+          resultado.toJson(),
+        );
+        return;
+      }
+
+      if (path == '/auth/login' && request.method == 'POST') {
+        final cuerpo = await _leerJsonBody(request);
+        final resultado = _gestorUsuarios.iniciarSesion(
+          identificador: (cuerpo['identificador'] as String?) ?? '',
+          contrasena: (cuerpo['contrasena'] as String?) ?? '',
+        );
+        await _responderJson(
+          request.response,
+          HttpStatus.ok,
+          resultado.toJson(),
+        );
+        return;
+      }
+
+      if (path == '/auth/sesion' && request.method == 'GET') {
+        final token = _extraerBearerToken(request);
+        final usuario =
+            token == null ? null : _gestorUsuarios.obtenerUsuarioPorToken(token);
+        if (usuario == null) {
+          await _responderJson(
+            request.response,
+            HttpStatus.unauthorized,
+            {'error': 'Sesión expirada o no válida.'},
+          );
+          return;
+        }
+        await _responderJson(
+          request.response,
+          HttpStatus.ok,
+          {'usuario': usuario.toPublicJson()},
+        );
+        return;
+      }
+
+      if (path == '/auth/logout' && request.method == 'POST') {
+        final token = _extraerBearerToken(request);
+        if (token != null) {
+          _gestorUsuarios.cerrarSesion(token);
+        }
+        await _responderJson(request.response, HttpStatus.ok, {'ok': true});
+        return;
+      }
+
+      await _responderJson(
+        request.response,
+        HttpStatus.notFound,
+        {'error': 'Ruta de autenticación no encontrada.'},
+      );
+    } on FalloAutenticacionServidor catch (fallo) {
+      await _responderJson(
+        request.response,
+        fallo.statusCode,
+        {
+          'error': fallo.mensaje,
+          'codigo': fallo.codigo,
+        },
+      );
+    } on FormatException catch (e) {
+      await _responderJson(
+        request.response,
+        HttpStatus.badRequest,
+        {'error': e.message},
+      );
+    } catch (_) {
+      await _responderJson(
+        request.response,
+        HttpStatus.internalServerError,
+        {'error': 'Error interno al procesar la autenticación.'},
+      );
+    }
+  }
+
+  Future<Map<String, dynamic>> _leerJsonBody(HttpRequest request) async {
+    const limiteBytes = 16 * 1024;
+    final bytes = <int>[];
+    await for (final chunk in request) {
+      bytes.addAll(chunk);
+      if (bytes.length > limiteBytes) {
+        throw const FormatException('La solicitud supera el tamaño permitido.');
+      }
+    }
+    final texto = utf8.decode(bytes);
+    if (texto.trim().isEmpty) {
+      throw const FormatException('El cuerpo JSON está vacío.');
+    }
+    final decoded = jsonDecode(texto);
+    if (decoded is! Map<String, dynamic>) {
+      throw const FormatException('Se esperaba un objeto JSON.');
+    }
+    return decoded;
+  }
+
+  String? _extraerBearerToken(HttpRequest request) {
+    final header = request.headers.value(HttpHeaders.authorizationHeader);
+    if (header == null || header.isEmpty) return null;
+    const prefijo = 'Bearer ';
+    if (header.startsWith(prefijo)) {
+      return header.substring(prefijo.length).trim();
+    }
+    return null;
+  }
+
+  Future<void> _responderJson(
+    HttpResponse response,
+    int statusCode,
+    Map<String, dynamic> data,
+  ) async {
+    response.statusCode = statusCode;
+    response.headers.contentType = ContentType.json;
+    response.write(jsonEncode(data));
+    await response.close();
   }
 
   void _registrarConexion(WebSocket socket) {
