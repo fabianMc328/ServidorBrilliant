@@ -60,6 +60,7 @@ class ServidorWebsocketBrilliant {
 
     _gestor = GestorSalas(
       enviarEventoAJugador: _enviarEventoAJugador,
+      alFinalizarPartida: _gestorUsuarios.registrarResultadoPartidaSala,
       tiempos: _tiempos,
       random: _random,
     );
@@ -173,6 +174,12 @@ class ServidorWebsocketBrilliant {
       return;
     }
 
+    if (request.uri.path == '/rankings' ||
+        request.uri.path.startsWith('/rankings/')) {
+      await _manejarPeticionRankings(request);
+      return;
+    }
+
     if (!WebSocketTransformer.isUpgradeRequest(request)) {
       request.response.statusCode = HttpStatus.badRequest;
       request.response.write('Se requiere conexión WebSocket.');
@@ -251,7 +258,10 @@ class ServidorWebsocketBrilliant {
         await _responderJson(
           request.response,
           HttpStatus.ok,
-          {'usuario': usuario.toPublicJson()},
+          {
+            'usuario': usuario.toPublicJson(),
+            'respaldoCuenta': usuario.toStorageJson(),
+          },
         );
         return;
       }
@@ -290,6 +300,80 @@ class ServidorWebsocketBrilliant {
         request.response,
         HttpStatus.internalServerError,
         {'error': 'Error interno al procesar la autenticación.'},
+      );
+    }
+  }
+
+  Future<void> _manejarPeticionRankings(HttpRequest request) async {
+    final path = request.uri.path;
+
+    try {
+      if (path == '/rankings' && request.method == 'GET') {
+        await _responderJson(
+          request.response,
+          HttpStatus.ok,
+          _gestorUsuarios.obtenerRankingsJson(),
+        );
+        return;
+      }
+
+      if (path == '/rankings/sincronizar' && request.method == 'POST') {
+        final cuerpo = await _leerJsonBody(request);
+        final resultado = _gestorUsuarios.sincronizarRespaldoHibrido(cuerpo);
+        await _responderJson(
+          request.response,
+          HttpStatus.ok,
+          resultado,
+        );
+        return;
+      }
+
+      if (path == '/rankings/solitario' && request.method == 'POST') {
+        final cuerpo = await _leerJsonBody(request);
+        final token = _extraerBearerToken(request);
+        final apodo = cuerpo['apodo'] as String?;
+        final puntaje = (cuerpo['puntaje'] as num?)?.toInt() ?? 0;
+
+        final actualizado = _gestorUsuarios.registrarPuntajeSolitario(
+          token: token,
+          apodo: apodo,
+          puntaje: puntaje,
+        );
+        if (actualizado == null) {
+          await _responderJson(
+            request.response,
+            HttpStatus.notFound,
+            {'error': 'No se encontró la cuenta para registrar el puntaje.'},
+          );
+          return;
+        }
+        await _responderJson(
+          request.response,
+          HttpStatus.ok,
+          {
+            'usuario': actualizado.toPublicJson(),
+            'rankings': _gestorUsuarios.obtenerRankingsJson(),
+          },
+        );
+        return;
+      }
+
+      await _responderJson(
+        request.response,
+        HttpStatus.notFound,
+        {'error': 'Ruta de rankings no encontrada.'},
+      );
+    } on FormatException catch (e) {
+      await _responderJson(
+        request.response,
+        HttpStatus.badRequest,
+        {'error': e.message},
+      );
+    } catch (_) {
+      await _responderJson(
+        request.response,
+        HttpStatus.internalServerError,
+        {'error': 'Error interno al procesar los rankings.'},
       );
     }
   }

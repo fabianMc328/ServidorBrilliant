@@ -385,5 +385,121 @@ void main() {
       expect(statusLoginWeb, HttpStatus.ok);
       expect((bodyLoginWeb['usuario'] as Map)['apodo'], 'JugadorUnico');
     });
+
+    test('Rankings Multijugador/Solitario y restauración híbrida completa tras reinicio del servidor', () async {
+      final servidor1 = ServidorWebsocketBrilliant(persistirUsuarios: false);
+      final puerto1 = await servidor1.iniciar(
+        direccion: InternetAddress.loopbackIPv4,
+        puerto: 0,
+      );
+      addTearDown(servidor1.detener);
+      final base1 = 'http://127.0.0.1:$puerto1';
+
+      // Registrar a Fabian y Carlos
+      final (_, regFabian) = await _peticionJson(
+        metodo: 'POST',
+        uri: Uri.parse('$base1/auth/registro'),
+        body: {
+          'apodo': 'Fabian',
+          'email': 'fabian@gmail.com',
+          'contrasena': 'clave123',
+          'dispositivoId': 'disp_f',
+        },
+      );
+      final tokenFabian = regFabian['token'] as String;
+
+      final (_, regCarlos) = await _peticionJson(
+        metodo: 'POST',
+        uri: Uri.parse('$base1/auth/registro'),
+        body: {
+          'apodo': 'Carlos',
+          'email': 'carlos@gmail.com',
+          'contrasena': 'clave123',
+          'dispositivoId': 'disp_c',
+        },
+      );
+      final tokenCarlos = regCarlos['token'] as String;
+
+      // Terminar partida multijugador: Fabian gana con 26 pts, Carlos hace 19 pts
+      servidor1.gestorUsuarios.registrarResultadoPartidaSala(const [
+        ResultadoJugadorRankingSala(
+          apodo: 'Fabian',
+          puntuacion: 26,
+          esGanador: true,
+        ),
+        ResultadoJugadorRankingSala(
+          apodo: 'Carlos',
+          puntuacion: 19,
+          esGanador: false,
+        ),
+      ]);
+
+      // Carlos registra récord de 34 pts en Modo Solitario
+      final (statusSol, _) = await _peticionJson(
+        metodo: 'POST',
+        uri: Uri.parse('$base1/rankings/solitario'),
+        bearerToken: tokenCarlos,
+        body: {'apodo': 'Carlos', 'puntaje': 34},
+      );
+      expect(statusSol, HttpStatus.ok);
+
+      // Consultar GET /rankings
+      final (statusRank, bodyRank) = await _peticionJson(
+        metodo: 'GET',
+        uri: Uri.parse('$base1/rankings'),
+      );
+      expect(statusRank, HttpStatus.ok);
+      final topMulti = bodyRank['multijugador'] as List;
+      final topSol = bodyRank['solitario'] as List;
+      expect((topMulti.first as Map)['apodo'], 'Fabian');
+      expect((topMulti.first as Map)['victoriasMulti'], 1);
+      expect((topMulti.first as Map)['mejorPuntajeMulti'], 26);
+      expect((topSol.first as Map)['apodo'], 'Carlos');
+      expect((topSol.first as Map)['mejorPuntajeSolitario'], 34);
+
+      final respaldoCliente = bodyRank['respaldoCuentas'] as List;
+      expect(respaldoCliente.length, 2);
+
+      // Simular que Render Free se durmió y levantó un contenedor nuevo en 0 usuarios
+      final servidor2 = ServidorWebsocketBrilliant(persistirUsuarios: false);
+      final puerto2 = await servidor2.iniciar(
+        direccion: InternetAddress.loopbackIPv4,
+        puerto: 0,
+      );
+      addTearDown(servidor2.detener);
+      final base2 = 'http://127.0.0.1:$puerto2';
+      expect(servidor2.gestorUsuarios.cantidadUsuarios, 0);
+
+      // El cliente sincroniza su respaldo de SharedPreferences al servidor recién despierto
+      final (statusSync, bodySync) = await _peticionJson(
+        metodo: 'POST',
+        uri: Uri.parse('$base2/rankings/sincronizar'),
+        body: {
+          'cuentas': respaldoCliente,
+          'sesionActiva': {
+            'token': tokenFabian,
+            'apodo': 'Fabian',
+            'dispositivoId': 'disp_f',
+          },
+        },
+      );
+      expect(statusSync, HttpStatus.ok);
+      expect(servidor2.gestorUsuarios.cantidadUsuarios, 2);
+
+      // Las cuentas, sesiones y rankings siguen intactos tras el reinicio
+      final multiRestaurado = bodySync['multijugador'] as List;
+      final solRestaurado = bodySync['solitario'] as List;
+      expect((multiRestaurado.first as Map)['apodo'], 'Fabian');
+      expect((multiRestaurado.first as Map)['victoriasMulti'], 1);
+      expect((solRestaurado.first as Map)['apodo'], 'Carlos');
+      expect((solRestaurado.first as Map)['mejorPuntajeSolitario'], 34);
+
+      final (statusSesionRestaurada, _) = await _peticionJson(
+        metodo: 'GET',
+        uri: Uri.parse('$base2/auth/sesion?dispositivoId=disp_f'),
+        bearerToken: tokenFabian,
+      );
+      expect(statusSesionRestaurada, HttpStatus.ok);
+    });
   });
 }

@@ -35,6 +35,10 @@ typedef EnviarEventoJugador = void Function(
   EventoServidor evento,
 );
 
+typedef AlFinalizarPartidaSala = void Function(
+  List<ResultadoJugadorRankingSala> resultados,
+);
+
 class _EstadoInternoJugador {
   final String id;
   final String tokenSesion;
@@ -118,6 +122,7 @@ class _SalaActiva {
 /// Motor autoritativo de salas, lobbies, sincronización de rondas, concesión y reconexiones.
 class GestorSalas {
   final EnviarEventoJugador _enviarA;
+  final AlFinalizarPartidaSala? _alFinalizarPartida;
   final ConfiguracionTiemposServidor _tiempos;
   final Random _random;
   final Map<String, _SalaActiva> _salasPorCodigo = {};
@@ -127,9 +132,11 @@ class GestorSalas {
 
   GestorSalas({
     required EnviarEventoJugador enviarEventoAJugador,
+    AlFinalizarPartidaSala? alFinalizarPartida,
     ConfiguracionTiemposServidor tiempos = const ConfiguracionTiemposServidor(),
     Random? random,
   })  : _enviarA = enviarEventoAJugador,
+        _alFinalizarPartida = alFinalizarPartida,
         _tiempos = tiempos,
         _random = random ?? Random() {
     _relojGlobal =
@@ -1132,6 +1139,7 @@ class GestorSalas {
           .join(' y ');
       sala.mensajeEventoReciente =
           '¡Partida finalizada! Ganador(es): $nombresGanadores.';
+      _notificarRankingFinSala(sala);
       _difundirEstadoSala(sala);
       return;
     }
@@ -1179,10 +1187,26 @@ class GestorSalas {
         sala.mensajeEventoReciente =
             '¡${activos.first.apodo} gana la partida porque los demás rivales se retiraron!';
       }
+      _notificarRankingFinSala(sala);
       _difundirEstadoSala(sala);
       return true;
     }
     return false;
+  }
+
+  void _notificarRankingFinSala(_SalaActiva sala) {
+    final callback = _alFinalizarPartida;
+    if (callback == null) return;
+    final resultados = sala.jugadores
+        .map(
+          (j) => ResultadoJugadorRankingSala(
+            apodo: j.apodo,
+            puntuacion: j.puntuacionTotal,
+            esGanador: sala.ganadoresIds.contains(j.id),
+          ),
+        )
+        .toList();
+    callback(resultados);
   }
 
   bool _todosEnCompetenciaConfirmaron(_SalaActiva sala) {

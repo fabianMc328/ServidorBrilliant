@@ -62,7 +62,20 @@ class FalloAutenticacionServidor implements Exception {
   String toString() => 'FalloAutenticacionServidor($codigo): $mensaje';
 }
 
-/// Cuenta registrada en el servidor autoritativo de Brilliant.
+/// Resultado de un jugador al concluir una sala multijugador para actualizar el ranking.
+class ResultadoJugadorRankingSala {
+  final String apodo;
+  final int puntuacion;
+  final bool esGanador;
+
+  const ResultadoJugadorRankingSala({
+    required this.apodo,
+    required this.puntuacion,
+    required this.esGanador,
+  });
+}
+
+/// Cuenta registrada en el servidor autoritativo de Brilliant con estadísticas de Ranking.
 class UsuarioCuenta {
   final String id;
   final String apodo;
@@ -70,14 +83,26 @@ class UsuarioCuenta {
   final DateTime fechaRegistro;
   final String sal;
   final String hashContrasena;
+  int victoriasMulti;
+  int partidasMulti;
+  int puntosTotalesMulti;
+  int mejorPuntajeMulti;
+  int mejorPuntajeSolitario;
+  int partidasSolitario;
 
-  const UsuarioCuenta({
+  UsuarioCuenta({
     required this.id,
     required this.apodo,
     required this.email,
     required this.fechaRegistro,
     required this.sal,
     required this.hashContrasena,
+    this.victoriasMulti = 0,
+    this.partidasMulti = 0,
+    this.puntosTotalesMulti = 0,
+    this.mejorPuntajeMulti = 0,
+    this.mejorPuntajeSolitario = 0,
+    this.partidasSolitario = 0,
   });
 
   Map<String, dynamic> toPublicJson() => {
@@ -85,6 +110,22 @@ class UsuarioCuenta {
         'apodo': apodo,
         'email': email,
         'fechaRegistro': fechaRegistro.toUtc().toIso8601String(),
+        'victoriasMulti': victoriasMulti,
+        'partidasMulti': partidasMulti,
+        'puntosTotalesMulti': puntosTotalesMulti,
+        'mejorPuntajeMulti': mejorPuntajeMulti,
+        'mejorPuntajeSolitario': mejorPuntajeSolitario,
+        'partidasSolitario': partidasSolitario,
+      };
+
+  Map<String, dynamic> toRankingJson() => {
+        'apodo': apodo,
+        'victoriasMulti': victoriasMulti,
+        'partidasMulti': partidasMulti,
+        'puntosTotalesMulti': puntosTotalesMulti,
+        'mejorPuntajeMulti': mejorPuntajeMulti,
+        'mejorPuntajeSolitario': mejorPuntajeSolitario,
+        'partidasSolitario': partidasSolitario,
       };
 
   Map<String, dynamic> toStorageJson() => {
@@ -94,6 +135,12 @@ class UsuarioCuenta {
         'fechaRegistro': fechaRegistro.toUtc().toIso8601String(),
         'sal': sal,
         'hashContrasena': hashContrasena,
+        'victoriasMulti': victoriasMulti,
+        'partidasMulti': partidasMulti,
+        'puntosTotalesMulti': puntosTotalesMulti,
+        'mejorPuntajeMulti': mejorPuntajeMulti,
+        'mejorPuntajeSolitario': mejorPuntajeSolitario,
+        'partidasSolitario': partidasSolitario,
       };
 
   factory UsuarioCuenta.fromStorageJson(Map<String, dynamic> json) {
@@ -106,6 +153,13 @@ class UsuarioCuenta {
               DateTime.now().toUtc(),
       sal: json['sal'] as String,
       hashContrasena: json['hashContrasena'] as String,
+      victoriasMulti: (json['victoriasMulti'] as num?)?.toInt() ?? 0,
+      partidasMulti: (json['partidasMulti'] as num?)?.toInt() ?? 0,
+      puntosTotalesMulti: (json['puntosTotalesMulti'] as num?)?.toInt() ?? 0,
+      mejorPuntajeMulti: (json['mejorPuntajeMulti'] as num?)?.toInt() ?? 0,
+      mejorPuntajeSolitario:
+          (json['mejorPuntajeSolitario'] as num?)?.toInt() ?? 0,
+      partidasSolitario: (json['partidasSolitario'] as num?)?.toInt() ?? 0,
     );
   }
 }
@@ -157,10 +211,11 @@ class ResultadoAuthServidor {
   Map<String, dynamic> toJson() => {
         'usuario': usuario.toPublicJson(),
         'token': token,
+        'respaldoCuenta': usuario.toStorageJson(),
       };
 }
 
-/// Gestor autoritativo de cuentas de usuario, sesiones únicas e unicidad global de apodos.
+/// Gestor autoritativo de cuentas de usuario, sesiones únicas, rankings e hidratación híbrida.
 class GestorUsuarios {
   static final RegExp _regexEmail = RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]{2,}$');
   static final RegExp _regexCaracteresProhibidos = RegExp(
@@ -337,7 +392,6 @@ class GestorUsuarios {
       }
     }
 
-    // Si no tenía sesión HTTP pero el apodo está conectado en una sala multijugador activa desde otro cliente
     if (sesionActiva == null &&
         (tieneConexionMultijugadorActiva?.call(usuario.apodo) ?? false)) {
       throw const FalloAutenticacionServidor(
@@ -358,8 +412,6 @@ class GestorUsuarios {
   }
 
   /// Devuelve la cuenta asociada a [token] y renueva su latido de actividad, o `null` si expiró/no existe.
-  /// Si [dispositivoId] pertenece a otra pestaña o dispositivo distinto al dueño del token activo,
-  /// lanza `409 SESION_YA_ACTIVA` para impedir que dos pestañas compartan la misma sesión.
   UsuarioCuenta? obtenerUsuarioPorToken(
     String token, {
     String? dispositivoId,
@@ -409,11 +461,192 @@ class GestorUsuarios {
     }
   }
 
+  /// Actualiza automáticamente las estadísticas de ranking cuando concluye una sala multijugador.
+  void registrarResultadoPartidaSala(
+    List<ResultadoJugadorRankingSala> resultados,
+  ) {
+    bool huboCambio = false;
+    for (final r in resultados) {
+      final clave = normalizarApodoClave(r.apodo);
+      final usuario = _usuariosPorApodoClave[clave];
+      if (usuario == null) continue;
+
+      usuario.partidasMulti += 1;
+      if (r.esGanador) {
+        usuario.victoriasMulti += 1;
+      }
+      final pts = r.puntuacion > 0 ? r.puntuacion : 0;
+      usuario.puntosTotalesMulti += pts;
+      if (pts > usuario.mejorPuntajeMulti) {
+        usuario.mejorPuntajeMulti = pts;
+      }
+      huboCambio = true;
+    }
+
+    if (huboCambio) {
+      _guardarEnDisco();
+    }
+  }
+
+  /// Registra el puntaje de una partida completada en Modo Solitario.
+  UsuarioCuenta? registrarPuntajeSolitario({
+    String? token,
+    String? apodo,
+    required int puntaje,
+  }) {
+    UsuarioCuenta? usuario;
+    if (token != null && token.trim().isNotEmpty) {
+      usuario = obtenerUsuarioPorToken(token);
+    }
+    if (usuario == null && apodo != null && apodo.trim().isNotEmpty) {
+      usuario = _usuariosPorApodoClave[normalizarApodoClave(apodo)];
+    }
+    if (usuario == null) return null;
+
+    final pts = puntaje > 0 ? puntaje : 0;
+    usuario.partidasSolitario += 1;
+    if (pts > usuario.mejorPuntajeSolitario) {
+      usuario.mejorPuntajeSolitario = pts;
+    }
+    _guardarEnDisco();
+    return usuario;
+  }
+
+  /// Devuelve las tablas de ranking ordenadas (Multijugador y Solitario) junto con el respaldo cifrado.
+  Map<String, dynamic> obtenerRankingsJson() {
+    final listaMulti = _usuariosPorId.values.toList()
+      ..sort((a, b) {
+        final cmpVic = b.victoriasMulti.compareTo(a.victoriasMulti);
+        if (cmpVic != 0) return cmpVic;
+        final cmpMejor = b.mejorPuntajeMulti.compareTo(a.mejorPuntajeMulti);
+        if (cmpMejor != 0) return cmpMejor;
+        final cmpTotal = b.puntosTotalesMulti.compareTo(a.puntosTotalesMulti);
+        if (cmpTotal != 0) return cmpTotal;
+        final cmpPartidas = b.partidasMulti.compareTo(a.partidasMulti);
+        if (cmpPartidas != 0) return cmpPartidas;
+        return a.apodo.toLowerCase().compareTo(b.apodo.toLowerCase());
+      });
+
+    final listaSolitario = _usuariosPorId.values.toList()
+      ..sort((a, b) {
+        final cmpMejor =
+            b.mejorPuntajeSolitario.compareTo(a.mejorPuntajeSolitario);
+        if (cmpMejor != 0) return cmpMejor;
+        final cmpPartidas = b.partidasSolitario.compareTo(a.partidasSolitario);
+        if (cmpPartidas != 0) return cmpPartidas;
+        return a.apodo.toLowerCase().compareTo(b.apodo.toLowerCase());
+      });
+
+    return {
+      'multijugador': listaMulti.map((u) => u.toRankingJson()).toList(),
+      'solitario': listaSolitario.map((u) => u.toRankingJson()).toList(),
+      'respaldoCuentas':
+          _usuariosPorId.values.map((u) => u.toStorageJson()).toList(),
+    };
+  }
+
+  /// Restaura y fusiona cuentas y estadísticas desde el respaldo local del cliente cuando
+  /// el contenedor gratuito de Render despierta tras haberse reiniciado.
+  Map<String, dynamic> sincronizarRespaldoHibrido(
+    Map<String, dynamic> payload,
+  ) {
+    bool huboCambio = false;
+    final cuentasRaw = payload['cuentas'];
+    if (cuentasRaw is List) {
+      for (final item in cuentasRaw) {
+        if (item is! Map<String, dynamic>) continue;
+        try {
+          final respaldada = UsuarioCuenta.fromStorageJson(item);
+          if (respaldada.apodo.trim().isEmpty ||
+              respaldada.email.trim().isEmpty ||
+              respaldada.sal.trim().isEmpty ||
+              respaldada.hashContrasena.trim().isEmpty) {
+            continue;
+          }
+          final claveApodo = normalizarApodoClave(respaldada.apodo);
+          final emailLower = respaldada.email.trim().toLowerCase();
+
+          final existente = _usuariosPorApodoClave[claveApodo] ??
+              _usuariosPorEmail[emailLower] ??
+              _usuariosPorId[respaldada.id];
+
+          if (existente == null) {
+            _usuariosPorId[respaldada.id] = respaldada;
+            _usuariosPorApodoClave[claveApodo] = respaldada;
+            _usuariosPorEmail[emailLower] = respaldada;
+            huboCambio = true;
+          } else {
+            if (respaldada.victoriasMulti > existente.victoriasMulti) {
+              existente.victoriasMulti = respaldada.victoriasMulti;
+              huboCambio = true;
+            }
+            if (respaldada.partidasMulti > existente.partidasMulti) {
+              existente.partidasMulti = respaldada.partidasMulti;
+              huboCambio = true;
+            }
+            if (respaldada.puntosTotalesMulti > existente.puntosTotalesMulti) {
+              existente.puntosTotalesMulti = respaldada.puntosTotalesMulti;
+              huboCambio = true;
+            }
+            if (respaldada.mejorPuntajeMulti > existente.mejorPuntajeMulti) {
+              existente.mejorPuntajeMulti = respaldada.mejorPuntajeMulti;
+              huboCambio = true;
+            }
+            if (respaldada.mejorPuntajeSolitario >
+                existente.mejorPuntajeSolitario) {
+              existente.mejorPuntajeSolitario =
+                  respaldada.mejorPuntajeSolitario;
+              huboCambio = true;
+            }
+            if (respaldada.partidasSolitario > existente.partidasSolitario) {
+              existente.partidasSolitario = respaldada.partidasSolitario;
+              huboCambio = true;
+            }
+          }
+        } catch (_) {}
+      }
+    }
+
+    // Si el cliente tenía una sesión activa válida antes de que Render durmiera, restaurarla
+    // únicamente si esa cuenta no tiene ya otra sesión activa en otro dispositivo.
+    final sesionRaw = payload['sesionActiva'];
+    if (sesionRaw is Map<String, dynamic>) {
+      final token = (sesionRaw['token'] as String?)?.trim();
+      final apodo = (sesionRaw['apodo'] as String?)?.trim();
+      final dispId = (sesionRaw['dispositivoId'] as String?)?.trim();
+      if (token != null &&
+          token.isNotEmpty &&
+          apodo != null &&
+          apodo.isNotEmpty) {
+        final usuario = _usuariosPorApodoClave[normalizarApodoClave(apodo)];
+        if (usuario != null) {
+          final activa = _obtenerSesionActivaDeUsuario(usuario);
+          if (activa == null) {
+            _sesionesPorToken[token] = SesionActivaCuenta(
+              token: token,
+              usuarioId: usuario.id,
+              dispositivoId:
+                  (dispId != null && dispId.isNotEmpty) ? dispId : null,
+              ultimaActividad: DateTime.now().toUtc(),
+            );
+            huboCambio = true;
+          }
+        }
+      }
+    }
+
+    if (huboCambio) {
+      _guardarEnDisco();
+    }
+    return obtenerRankingsJson();
+  }
+
   bool _sesionSigueVigente(SesionActivaCuenta sesion, UsuarioCuenta usuario) {
     if (tieneConexionMultijugadorActiva?.call(usuario.apodo) ?? false) {
       return true;
     }
-    final transcurrido = DateTime.now().toUtc().difference(sesion.ultimaActividad);
+    final transcurrido =
+        DateTime.now().toUtc().difference(sesion.ultimaActividad);
     return transcurrido <= duracionInactividadSesion;
   }
 
@@ -443,8 +676,9 @@ class GestorUsuarios {
     _sesionesPorToken[token] = SesionActivaCuenta(
       token: token,
       usuarioId: usuarioId,
-      dispositivoId:
-          (dispositivoId != null && dispositivoId.isNotEmpty) ? dispositivoId : null,
+      dispositivoId: (dispositivoId != null && dispositivoId.isNotEmpty)
+          ? dispositivoId
+          : null,
       ultimaActividad: DateTime.now().toUtc(),
     );
     return token;
@@ -529,9 +763,8 @@ class GestorUsuarios {
       throw FalloAutenticacionServidor(
         statusCode: HttpStatus.badRequest,
         codigo: 'CONTRASENA_INVALIDA',
-        mensaje: esRegistro
-            ? 'Ingresa una contraseña.'
-            : 'Ingresa tu contraseña.',
+        mensaje:
+            esRegistro ? 'Ingresa una contraseña.' : 'Ingresa tu contraseña.',
       );
     }
     if (RegExp(r'\s').hasMatch(contrasena)) {
